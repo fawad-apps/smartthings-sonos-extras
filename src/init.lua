@@ -18,6 +18,29 @@ local sonos_driver = Driver("Sonos Extras", {
             [capabilities.switch.commands.on.NAME] = command_handlers.switch_on,
             [capabilities.switch.commands.off.NAME] = command_handlers.switch_off
         },
+        [capabilities.switchLevel.ID] = {
+            [capabilities.switchLevel.commands.setLevel.NAME] = command_handlers.set_level
+        },
+        [capabilities.audioVolume.ID] = {
+            [capabilities.audioVolume.commands.setVolume.NAME] = command_handlers.set_volume,
+            [capabilities.audioVolume.commands.volumeUp.NAME] = command_handlers.volume_up,
+            [capabilities.audioVolume.commands.volumeDown.NAME] = command_handlers.volume_down
+        },
+        [capabilities.audioMute.ID] = {
+            [capabilities.audioMute.commands.setMute.NAME] = command_handlers.set_mute,
+            [capabilities.audioMute.commands.mute.NAME] = command_handlers.mute,
+            [capabilities.audioMute.commands.unmute.NAME] = command_handlers.unmute
+        },
+        [capabilities.mediaPlayback.ID] = {
+            [capabilities.mediaPlayback.commands.play.NAME] = command_handlers.play,
+            [capabilities.mediaPlayback.commands.pause.NAME] = command_handlers.pause,
+            [capabilities.mediaPlayback.commands.stop.NAME] = command_handlers.stop,
+            [capabilities.mediaPlayback.commands.setPlaybackStatus.NAME] = command_handlers.set_playback_status
+        },
+        [capabilities.mediaTrackControl.ID] = {
+            [capabilities.mediaTrackControl.commands.nextTrack.NAME] = command_handlers.next_track,
+            [capabilities.mediaTrackControl.commands.previousTrack.NAME] = command_handlers.previous_track
+        },
         [capabilities.refresh.ID] = {
             [capabilities.refresh.commands.refresh.NAME] = command_handlers.refresh
         }

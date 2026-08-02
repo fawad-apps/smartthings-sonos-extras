@@ -1,7 +1,16 @@
 name: sonos-extras
 components:
   - id: main
+    label: Sound
     capabilities:
+      - id: audioVolume
+        version: 1
+      - id: audioMute
+        version: 1
+      - id: mediaPlayback
+        version: 1
+      - id: mediaTrackControl
+        version: 1
       - id: refresh
         version: 1
   - id: DialogLevel
@@ -22,6 +31,27 @@ components:
     label: Surround Mode
     capabilities:
       - id: switch
+        version: 1
+    categories:
+      - name: Switch
+  - id: SubGain
+    label: Sub Level
+    capabilities:
+      - id: switchLevel
+        version: 1
+    categories:
+      - name: Switch
+  - id: HeightLevel
+    label: Height/Atmos Level
+    capabilities:
+      - id: switchLevel
+        version: 1
+    categories:
+      - name: Switch
+  - id: SurroundLevel
+    label: Surround Level
+    capabilities:
+      - id: switchLevel
         version: 1
     categories:
       - name: Switch

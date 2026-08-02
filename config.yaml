@@ -1,4 +1,4 @@
-name: Sonos Extra Control
+name: Sonos Extras (Arc Ultra)
 packageKey: rym002.sonosextras
 permissions:
   lan: {}
