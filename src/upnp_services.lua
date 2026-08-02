@@ -10,23 +10,25 @@ local upnp_services = {}
 upnp_services.service_id = "urn:upnp-org:serviceId:RenderingControl"
 upnp_services.searchtarget = 'urn:schemas-upnp-org:device:MediaRenderer:1'
 
-local switchMapping = {
-    ['0'] = capabilities.switch.switch.off(),
-    ['1'] = capabilities.switch.switch.on()
-}
-
 local commandMapping = {
     ['off'] = 0,
     ['on'] = 1
 }
-local function emit_switch_capability_event(name, device, value)
-    local event = switchMapping[value]
-    if event then
-        local component = device.profile.components[name]
-        device:emit_component_event(component, event)
-    else
-        log.error('Missing event')
+
+-- Sonos EQ values are historically 0/1, but newer models (e.g. Arc Ultra)
+-- report DialogLevel as an intensity 1-4. Treat any non-zero value as "on"
+-- so the switch stays meaningful across all models.
+local function switch_event_for_value(value)
+    if value == nil or value == '0' or value == 0 then
+        return capabilities.switch.switch.off()
     end
+    return capabilities.switch.switch.on()
+end
+
+local function emit_switch_capability_event(name, device, value)
+    local event = switch_event_for_value(value)
+    local component = device.profile.components[name]
+    device:emit_component_event(component, event)
 end
 
 local eq_types = {

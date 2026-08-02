@@ -5,11 +5,37 @@ local socket = require "cosock.socket"
 local upnp_services = require "upnp_services"
 local discovery = {}
 
+-- Known Sonos home-theater model numbers (fast path).
 local profiles = {
-    ["S9"] = "sonos-extras",
-    ["S14"] = "sonos-extras",
-    ["S19"] = "sonos-extras"
+    ["S9"] = "sonos-extras",  -- Playbar
+    ["S14"] = "sonos-extras", -- Beam (Gen 1)
+    ["S19"] = "sonos-extras"  -- Arc
 }
+
+-- Fallback so newer / unlisted Sonos soundbars (e.g. Arc Ultra, Beam Gen 2,
+-- Ray) are supported without adding a model number here. We only match Sonos
+-- home-theater devices by name, so satellite speakers (One, Era, etc.) that
+-- don't expose these EQ settings aren't picked up.
+local soundbar_keywords = { "arc", "beam", "ray", "playbar" }
+
+local function resolve_profile(devinfo)
+    local by_model = profiles[devinfo.modelNumber]
+    if by_model then
+        return by_model
+    end
+
+    local manufacturer = (devinfo.manufacturer or ""):lower()
+    if manufacturer:find("sonos", 1, true) then
+        local name = ((devinfo.modelName or "") .. " " .. (devinfo.modelDescription or "")):lower()
+        for _, keyword in ipairs(soundbar_keywords) do
+            if name:find(keyword, 1, true) then
+                return "sonos-extras"
+            end
+        end
+    end
+
+    return nil
+end
 
 local newly_added = {}
 
@@ -31,17 +57,20 @@ function discovery.handler(driver, opts, should_continue)
             local id = upnpdev.uuid
             if not known_devices[id] and not found_devices[id] then
                 found_devices[id] = true
-                local modelNumber = upnpdev:devinfo().modelNumber
-                local devprofile = profiles[modelNumber]
+                local devinfo = upnpdev:devinfo()
+                local modelNumber = devinfo.modelNumber
+                local devprofile = resolve_profile(devinfo)
                 if devprofile then
+                    log.info(string.format("Matched Sonos device '%s' model %s",
+                        devinfo.friendlyName or "?", modelNumber or "?"))
                     local create_device_msg = {
                         type = "LAN",
                         device_network_id = id,
-                        label = upnpdev:devinfo().friendlyName,
+                        label = devinfo.friendlyName,
                         profile = devprofile,
-                        manufacturer = upnpdev:devinfo().manufacturer,
+                        manufacturer = devinfo.manufacturer,
                         model = modelNumber,
-                        vendor_provided_label = upnpdev:devinfo().modelName
+                        vendor_provided_label = devinfo.modelName
                     }
 
                     assert(driver:try_create_device(create_device_msg), "failed to create device record")
