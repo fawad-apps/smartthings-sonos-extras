@@ -3,12 +3,18 @@ local capabilities = require "st.capabilities"
 local Driver = require "st.driver"
 local lifecycle = require "lifecycle"
 local command_handlers = require "command_handlers"
+local log = require "log"
+
+-- Loud startup marker: if this line is absent from logcat, the driver never
+-- loaded and nothing below it is running.
+log.info("=== Sonos Extras: driver module loaded ===")
 
 local sonos_driver = Driver("Sonos Extras", {
     discovery = discovery.handler,
     lifecycle_handlers = {
         added = lifecycle.device_added,
         init = lifecycle.device_init,
+        driverSwitched = lifecycle.driver_switched,
         removed = lifecycle.device_removed,
         deleted = lifecycle.device_removed
     },
@@ -47,6 +53,22 @@ local sonos_driver = Driver("Sonos Extras", {
             [capabilities.mediaTrackControl.commands.nextTrack.NAME] = command_handlers.next_track,
             [capabilities.mediaTrackControl.commands.previousTrack.NAME] = command_handlers.previous_track
         },
+        [capabilities.mediaPresets.ID] = {
+            [capabilities.mediaPresets.commands.playPreset.NAME] = command_handlers.play_preset
+        },
+        [capabilities.audioNotification.ID] = {
+            [capabilities.audioNotification.commands.playTrack.NAME] = command_handlers.play_track,
+            [capabilities.audioNotification.commands.playTrackAndResume.NAME] = command_handlers.play_track_and_resume,
+            [capabilities.audioNotification.commands.playTrackAndRestore.NAME] = command_handlers.play_track_and_restore
+        },
+        [capabilities.mediaGroup.ID] = {
+            [capabilities.mediaGroup.commands.setGroupVolume.NAME] = command_handlers.set_group_volume,
+            [capabilities.mediaGroup.commands.groupVolumeUp.NAME] = command_handlers.group_volume_up,
+            [capabilities.mediaGroup.commands.groupVolumeDown.NAME] = command_handlers.group_volume_down,
+            [capabilities.mediaGroup.commands.setGroupMute.NAME] = command_handlers.set_group_mute,
+            [capabilities.mediaGroup.commands.muteGroup.NAME] = command_handlers.mute_group,
+            [capabilities.mediaGroup.commands.unmuteGroup.NAME] = command_handlers.unmute_group
+        },
         [capabilities.refresh.ID] = {
             [capabilities.refresh.commands.refresh.NAME] = command_handlers.refresh
         }
@@ -55,4 +77,5 @@ local sonos_driver = Driver("Sonos Extras", {
 
 sonos_driver:call_on_schedule(lifecycle.SUBSCRIBETIME - 5, lifecycle.resubscribe_all, "Re-subscribe timer")
 
+log.info("=== Sonos Extras: starting driver run loop ===")
 sonos_driver:run()

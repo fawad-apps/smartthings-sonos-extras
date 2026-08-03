@@ -3,8 +3,11 @@ local upnp_services = require "upnp_services"
 
 local command_handlers = {}
 
+-- Match lifecycle.lua: identify room-group children by their ":group:" DNI, not
+-- by parent_device_id (which the platform sets to the hub for all LAN devices).
 local function is_room_child(device)
-    return device.parent_device_id ~= nil and device.parent_device_id ~= ''
+    local dni = device.device_network_id
+    return dni ~= nil and dni:find(":group:", 1, true) ~= nil
 end
 
 -- Switch handlers: a child device is a per-room group toggle; on the soundbar,
@@ -100,6 +103,53 @@ end
 
 function command_handlers.previous_track(driver, device, command)
     upnp_services.transport_previous(device)
+end
+
+-- Sonos favorites ----------------------------------------------------------
+function command_handlers.play_preset(driver, device, command)
+    upnp_services.play_preset(device, tostring(command.args.presetId))
+end
+
+-- Announcements ------------------------------------------------------------
+-- playTrack leaves the clip playing; playTrackAndResume restarts what was
+-- playing; playTrackAndRestore puts the transport back without resuming.
+function command_handlers.play_track(driver, device, command)
+    upnp_services.play_notification(device, command.args.uri, command.args.level, nil, false)
+end
+
+function command_handlers.play_track_and_resume(driver, device, command)
+    upnp_services.play_notification(device, command.args.uri, command.args.level,
+        command.args.duration, true)
+end
+
+function command_handlers.play_track_and_restore(driver, device, command)
+    upnp_services.play_notification(device, command.args.uri, command.args.level,
+        command.args.duration, false)
+end
+
+-- Group volume / mute ------------------------------------------------------
+function command_handlers.set_group_volume(driver, device, command)
+    upnp_services.set_group_volume(device, command.args.groupVolume)
+end
+
+function command_handlers.group_volume_up(driver, device, command)
+    upnp_services.adjust_group_volume(device, upnp_services.VOLUME_STEP)
+end
+
+function command_handlers.group_volume_down(driver, device, command)
+    upnp_services.adjust_group_volume(device, -upnp_services.VOLUME_STEP)
+end
+
+function command_handlers.set_group_mute(driver, device, command)
+    upnp_services.set_group_mute(device, command.args.groupMute == 'muted')
+end
+
+function command_handlers.mute_group(driver, device, command)
+    upnp_services.set_group_mute(device, true)
+end
+
+function command_handlers.unmute_group(driver, device, command)
+    upnp_services.set_group_mute(device, false)
 end
 
 -- Refresh ------------------------------------------------------------------

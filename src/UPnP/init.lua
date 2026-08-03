@@ -347,11 +347,17 @@ local function discover (target, waitsecs, callback)
           -- Build the upnp device object (including description)
           local upnpobj = build_device_object(headers)
             
-          if upnpobj ~= nil then  
-          
+          if upnpobj ~= nil then
+
             setmetatable(upnpobj, {__index = upnpDevice_prototype})
             callback(upnpobj)
-            
+
+          else
+            -- The usn was marked found before the description was fetched, so a
+            -- failed fetch would otherwise hide this device from every later
+            -- discovery in this process - making all retries useless.
+            ids_found[headers["usn"]] = nil
+
           end
         end
       end

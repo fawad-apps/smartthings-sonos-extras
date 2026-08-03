@@ -24,6 +24,63 @@ upnp_services.VOLUME_STEP = 5
 local AV_SERVICE_TYPE = "urn:schemas-upnp-org:service:AVTransport:1"
 local AV_CONTROL_PATH = "/MediaRenderer/AVTransport/Control"
 
+-- Sonos favorites live on the MediaServer sub-device, and group volume/mute on
+-- GroupRenderingControl - neither is part of the MediaRenderer description we
+-- discovered, so both are reached by direct SOAP to the player.
+local CD_SERVICE_TYPE = "urn:schemas-upnp-org:service:ContentDirectory:1"
+local CD_CONTROL_PATH = "/MediaServer/ContentDirectory/Control"
+local GRC_SERVICE_TYPE = "urn:schemas-upnp-org:service:GroupRenderingControl:1"
+local GRC_CONTROL_PATH = "/MediaRenderer/GroupRenderingControl/Control"
+
+-- Sonos favorites container.
+local FAVORITES_OBJECT_ID = "FV:2"
+
+-- How long to wait for a notification clip to finish when the caller didn't
+-- tell us its duration.
+local NOTIFICATION_MAX_SECONDS = 60
+
+-- ---------------------------------------------------------------------------
+-- Player identity
+-- ---------------------------------------------------------------------------
+
+-- We find players via the MediaRenderer sub-device, whose UDN carries an "_MR"
+-- suffix (RINCON_<mac>01400_MR), but ZoneGroupTopology members and the
+-- "x-rincon:" grouping URIs use the bare player UUID. Always canonicalize
+-- before comparing or building a URI. A device adopted from another driver
+-- ("Change driver") keeps that driver's DNI - SmartThings' own Sonos driver
+-- uses the bare MAC - so derive the UUID from that as a fallback.
+function upnp_services.player_uuid(device)
+    local upnpdev = device:get_field('upnpdevice')
+    local id = (upnpdev and upnpdev.uuid) or device.device_network_id or ""
+
+    local bare = id:match("^(RINCON_%w+)_MR$")
+    if bare then
+        return bare
+    end
+    if id:match("^RINCON_") then
+        return id
+    end
+
+    local mac = id:match("^(%x%x%x%x%x%x%x%x%x%x%x%x)$")
+    if mac then
+        return "RINCON_" .. mac:upper() .. "01400"
+    end
+    return id
+end
+
+-- True if a device record identifies the player behind this SSDP UUID: either
+-- an exact DNI match, or a bare-MAC DNI contained in the UUID.
+local function id_matches(dni, uuid)
+    if dni == uuid then
+        return true
+    end
+    local mac = dni and dni:match("^(%x%x%x%x%x%x%x%x%x%x%x%x)$")
+    return mac ~= nil and uuid:upper():find(mac:upper(), 1, true) ~= nil
+end
+
+-- Exposed for tests.
+upnp_services.id_matches = id_matches
+
 -- ---------------------------------------------------------------------------
 -- Feature configuration
 -- ---------------------------------------------------------------------------
@@ -102,8 +159,44 @@ local function get_component(device, id)
     return comp
 end
 
+-- Set by lifecycle so a rediscovered device can be fully re-initialised
+-- (monitoring + event subscriptions) without this module depending on lifecycle.
+upnp_services.reinit_hook = nil
+
+local reacquiring = false
+
+-- If discovery failed at startup the device has no UPnP handle and every
+-- command dies. Rather than stay broken until the driver restarts, try to find
+-- the player again on demand.
+function upnp_services.reacquire(device)
+    if reacquiring then
+        return nil
+    end
+    reacquiring = true
+    local ok, upnpdev = pcall(upnp_services.discover_device, device)
+    if ok and upnpdev then
+        log.info("Reacquired player for <" .. tostring(device.device_network_id) .. ">")
+        if upnp_services.reinit_hook then
+            pcall(upnp_services.reinit_hook, device, upnpdev)
+        else
+            upnpdev:init(device.driver, device)
+        end
+    else
+        -- Don't let the app show a healthy tile for a device we can't reach:
+        -- an offline marker is the only signal the user ever sees.
+        log.error("Could not reach player for <" .. tostring(device.device_network_id) .. ">")
+        device:offline()
+    end
+    reacquiring = false
+    return device:get_field("upnpdevice")
+end
+
+local function get_upnpdev(device)
+    return device:get_field("upnpdevice") or upnp_services.reacquire(device)
+end
+
 local function command(device, service_id, action, arguments)
-    local upnpdev = device:get_field("upnpdevice")
+    local upnpdev = get_upnpdev(device)
     if not upnpdev then
         log.error("Missing upnpdevice")
         return nil
@@ -124,12 +217,35 @@ local function av_command(device, action, arguments)
     return command(device, upnp_services.avtransport_service_id, action, arguments)
 end
 
--- Send a raw SOAP action to an explicit ip:port. Used to command *other*
--- Sonos players (for grouping) that aren't managed as SmartThings devices.
+local XML_ESCAPES = { ['&'] = '&amp;', ['<'] = '&lt;', ['>'] = '&gt;', ['"'] = '&quot;', ["'"] = '&apos;' }
+
+local function xml_escape(s)
+    return (tostring(s):gsub('[&<>"\']', XML_ESCAPES))
+end
+
+local XML_UNESCAPES = { amp = '&', lt = '<', gt = '>', quot = '"', apos = "'" }
+
+local function xml_unescape(s)
+    if not s then
+        return nil
+    end
+    return (s:gsub('&(#?%w+);', function(entity)
+        if entity:sub(1, 1) == '#' then
+            local n = tonumber(entity:sub(2))
+            return n and string.char(n % 256) or ('&' .. entity .. ';')
+        end
+        return XML_UNESCAPES[entity] or ('&' .. entity .. ';')
+    end))
+end
+
+-- Send a raw SOAP action to an explicit ip:port. Used both to command *other*
+-- Sonos players (for grouping) and to reach services that don't live on the
+-- MediaRenderer sub-device we discovered (ContentDirectory, GroupRenderingControl).
+-- Returns ok, response_body.
 local function soap_post(ip, port, path, service_type, action, args)
     local body_args = ''
     for name, value in pairs(args or {}) do
-        body_args = body_args .. '<' .. name .. '>' .. tostring(value) .. '</' .. name .. '>'
+        body_args = body_args .. '<' .. name .. '>' .. xml_escape(value) .. '</' .. name .. '>'
     end
     local body = string.format(
         '<?xml version="1.0" encoding="utf-8"?>' ..
@@ -155,7 +271,19 @@ local function soap_post(ip, port, path, service_type, action, args)
         log.error(string.format("SOAP %s to %s failed: %s", action, tostring(ip), tostring(code)))
         return false
     end
-    return true
+    return true, table.concat(resp_chunks)
+end
+
+-- Sonos exposes every service on the player's own ip:1400, so anything the
+-- discovered MediaRenderer description doesn't cover can still be reached
+-- directly. Returns ok, response_body.
+local function self_soap(device, path, service_type, action, args)
+    local upnpdev = get_upnpdev(device)
+    if not (upnpdev and upnpdev.ip) then
+        log.error("self_soap: no upnpdevice/ip")
+        return false
+    end
+    return soap_post(upnpdev.ip, upnpdev.port or "1400", path, service_type, action, args)
 end
 
 local function clamp(cfg, value)
@@ -419,7 +547,11 @@ local function collect_zone_groups(device)
                 end
             end
         end
-        table.insert(groups, { coordinator = g._attr and g._attr.Coordinator, members = members })
+        table.insert(groups, {
+            id = g._attr and g._attr.ID,
+            coordinator = g._attr and g._attr.Coordinator,
+            members = members
+        })
     end
     return groups
 end
@@ -430,7 +562,7 @@ end
 
 -- Group every other (visible) Sonos player under this soundbar.
 function upnp_services.group_all(device)
-    local self_uuid = device.device_network_id
+    local self_uuid = upnp_services.player_uuid(device)
     local groups = collect_zone_groups(device)
     if not groups then
         return
@@ -457,7 +589,7 @@ end
 
 -- Split every other player currently grouped with this soundbar into standalone.
 function upnp_services.ungroup_all(device)
-    local self_uuid = device.device_network_id
+    local self_uuid = upnp_services.player_uuid(device)
     local groups = collect_zone_groups(device)
     if not groups then
         set_party_switch(device, false)
@@ -485,7 +617,7 @@ function upnp_services.get_group_state(device)
     if not groups then
         return
     end
-    local self_uuid = device.device_network_id
+    local self_uuid = upnp_services.player_uuid(device)
     local grouped = false
     for _, group in ipairs(groups) do
         local contains_self, others = false, 0
@@ -518,15 +650,20 @@ end
 
 -- Create a child toggle device for every other visible Sonos room.
 function upnp_services.sync_rooms(driver, device)
-    local self_uuid = device.device_network_id
+    local self_uuid = upnp_services.player_uuid(device)
     local groups = collect_zone_groups(device)
     if not groups then
         return
     end
 
+    -- Key the dedup on the room UUID rather than the whole DNI, so children
+    -- created under an earlier DNI scheme aren't duplicated.
     local existing = {}
     for _, d in ipairs(driver:get_devices()) do
-        existing[d.device_network_id] = true
+        local room = d.device_network_id:match(":group:(.+)")
+        if room then
+            existing[room] = true
+        end
     end
 
     local created = 0
@@ -534,7 +671,7 @@ function upnp_services.sync_rooms(driver, device)
         for _, m in ipairs(group.members) do
             if m.uuid ~= self_uuid and not m.invisible then
                 local dni = self_uuid .. ":group:" .. m.uuid
-                if not existing[dni] then
+                if not existing[m.uuid] then
                     local ok = driver:try_create_device({
                         type = "LAN",
                         device_network_id = dni,
@@ -544,7 +681,7 @@ function upnp_services.sync_rooms(driver, device)
                     })
                     if ok then
                         created = created + 1
-                        existing[dni] = true
+                        existing[m.uuid] = true
                     end
                 end
             end
@@ -567,7 +704,7 @@ local function room_target(driver, child)
     for _, group in ipairs(groups) do
         for _, m in ipairs(group.members) do
             if m.uuid == room_uuid and m.ip then
-                return parent.device_network_id, m.ip, m.port
+                return upnp_services.player_uuid(parent), m.ip, m.port
             end
         end
     end
@@ -605,7 +742,7 @@ function upnp_services.refresh_room(driver, child)
     if not groups then
         return
     end
-    local parent_uuid = parent.device_network_id
+    local parent_uuid = upnp_services.player_uuid(parent)
     for _, group in ipairs(groups) do
         local has_room = false
         for _, m in ipairs(group.members) do
@@ -625,6 +762,397 @@ end
 -- Refresh
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Now playing (audioTrackData)
+-- ---------------------------------------------------------------------------
+
+-- DIDL-Lite is small and its shape varies by source, so pull fields with
+-- patterns rather than a full parse - the XML parser's node shape for
+-- attribute-bearing text elements isn't worth guessing at.
+-- Sonos returns this instead of a value for fields that don't apply to the
+-- current source (e.g. everything positional while on TV audio).
+local NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+
+local function usable(value)
+    if value == nil or value == '' or value == NOT_IMPLEMENTED then
+        return nil
+    end
+    return value
+end
+
+local function didl_field(didl, tag)
+    if not usable(didl) then
+        return nil
+    end
+    local pattern_tag = tag:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+    local raw = didl:match("<" .. pattern_tag .. "[^>]*>(.-)</" .. pattern_tag .. ">")
+    if not usable(raw) then
+        return nil
+    end
+    return xml_unescape(raw)
+end
+
+-- "http://<player ip>:<port>", used to absolutize player-relative album art.
+local function art_base_for(device)
+    local upnpdev = device:get_field("upnpdevice")
+    if not (upnpdev and upnpdev.ip) then
+        return nil
+    end
+    return string.format("http://%s:%s", upnpdev.ip, upnpdev.port or "1400")
+end
+
+-- Album art comes back as a player-relative path.
+local function absolute_art_url(art_base, uri)
+    if not uri then
+        return nil
+    end
+    if uri:match("^https?://") then
+        return uri
+    end
+    if not art_base then
+        return nil
+    end
+    if uri:sub(1, 1) ~= '/' then
+        uri = '/' .. uri
+    end
+    return art_base .. uri
+end
+
+-- Line-in style sources carry no metadata; name them from the transport URI.
+local function source_from_uri(uri)
+    if not uri then
+        return nil
+    end
+    if uri:match("^x%-sonos%-htastream:") then
+        return "TV Audio"
+    elseif uri:match("^x%-rincon%-stream:") then
+        return "Line In"
+    elseif uri:match("^x%-sonosapi%-stream:") or uri:match("^x%-rincon%-mp3radio:") then
+        return "Radio"
+    elseif uri:match("^x%-rincon:") then
+        return "Grouped"
+    end
+    return nil
+end
+
+-- Pure: DIDL in, audioTrackData table out. Kept separate from emitting so it
+-- can be tested against real Sonos payloads without a device.
+function upnp_services.build_track_data(track_didl, current_uri, current_didl, art_base)
+    local source = source_from_uri(current_uri)
+
+    -- A stream's useful title is often in r:streamContent, with the station
+    -- name in the enclosing CurrentURIMetaData instead.
+    local title = didl_field(track_didl, "dc:title")
+    local stream_content = didl_field(track_didl, "r:streamContent")
+    if stream_content and stream_content ~= '' then
+        title = stream_content
+    end
+
+    return {
+        title = title or source or "Unknown",
+        artist = didl_field(track_didl, "dc:creator"),
+        album = didl_field(track_didl, "upnp:album"),
+        albumArtUrl = absolute_art_url(art_base, didl_field(track_didl, "upnp:albumArtURI")),
+        mediaSource = source or didl_field(current_didl, "dc:title")
+    }
+end
+
+local function emit_track_data(device, track_didl, current_uri, current_didl)
+    local data = upnp_services.build_track_data(track_didl, current_uri, current_didl,
+        art_base_for(device))
+    emit(device, 'main', capabilities.audioTrackData.audioTrackData(data))
+end
+
+function upnp_services.get_track_data(device)
+    local pos = av_command(device, 'GetPositionInfo', { InstanceID = 0 })
+    local media = av_command(device, 'GetMediaInfo', { InstanceID = 0 })
+    local track_didl = pos and pos.GetPositionInfo and pos.GetPositionInfo.TrackMetaData
+    local current_uri = media and media.GetMediaInfo and media.GetMediaInfo.CurrentURI
+    local current_didl = media and media.GetMediaInfo and media.GetMediaInfo.CurrentURIMetaData
+    emit_track_data(device, track_didl, current_uri, current_didl)
+end
+
+-- ---------------------------------------------------------------------------
+-- Sonos favorites (mediaPresets)
+-- ---------------------------------------------------------------------------
+
+-- Play a favorite. Container-style favorites (a playlist, album or station
+-- from a music service) have to be queued and played from the queue; a plain
+-- track or stream URI can be set on the transport directly.
+local function play_uri(device, uri, meta)
+    if uri:match("^x%-rincon%-cpcontainer:") or uri:match("^x%-rincon%-playlist:")
+        or uri:match("^x%-rincon%-cpcontainer") or uri:match("^file:") then
+        local queue_uri = "x-rincon-queue:" .. upnp_services.player_uuid(device) .. "#0"
+        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'RemoveAllTracksFromQueue',
+            { InstanceID = 0 })
+        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'AddURIToQueue', {
+            InstanceID = 0,
+            EnqueuedURI = uri,
+            EnqueuedURIMetaData = meta or '',
+            DesiredFirstTrackNumberEnqueued = 0,
+            EnqueueAsNext = 1
+        })
+        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+            { InstanceID = 0, CurrentURI = queue_uri, CurrentURIMetaData = '' })
+    else
+        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+            { InstanceID = 0, CurrentURI = uri, CurrentURIMetaData = meta or '' })
+    end
+    self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'Play', { InstanceID = 0, Speed = 1 })
+end
+
+-- Pure: a ContentDirectory Browse SOAP body in, (presets, meta_by_id) out.
+-- Returns nil plus a reason so callers can log a real failure rather than
+-- silently emitting an empty favorites list.
+function upnp_services.parse_presets(body, art_base)
+    if not body then
+        return nil, "no response body"
+    end
+
+    -- The Result element is DIDL-Lite escaped inside the SOAP body.
+    local didl = xml_unescape(body:match("<Result>(.-)</Result>"))
+    if not didl then
+        return nil, "browse returned no Result element"
+    end
+
+    local presets, meta_by_id = {}, {}
+    for item in didl:gmatch("<item.-</item>") do
+        local id = item:match('id="([^"]*)"')
+        local title = didl_field(item, "dc:title")
+        if id and title then
+            -- r:resMD is the metadata Sonos wants handed back when playing it.
+            local meta = didl_field(item, "r:resMD")
+            local uri = didl_field(item, "res")
+
+            -- Sonos Radio favorites carry no <res>; they're container items, so
+            -- build the container URI from the id inside their metadata.
+            if not uri and meta and meta:match("<upnp:class>object%.container") then
+                local inner_id = meta:match('<item%s+id="([^"]*)"')
+                if inner_id then
+                    uri = "x-rincon-cpcontainer:" .. inner_id
+                end
+            end
+
+            local entry = { uri = uri, meta = meta }
+            if entry.uri then
+                meta_by_id[id] = entry
+                table.insert(presets, {
+                    id = id,
+                    name = title,
+                    imageUrl = absolute_art_url(art_base, didl_field(item, "upnp:albumArtURI")),
+                    mediaSource = didl_field(item, "r:description")
+                })
+            end
+        end
+    end
+
+    return presets, meta_by_id
+end
+
+function upnp_services.get_presets(device)
+    local ok, body = self_soap(device, CD_CONTROL_PATH, CD_SERVICE_TYPE, 'Browse', {
+        ObjectID = FAVORITES_OBJECT_ID,
+        BrowseFlag = 'BrowseDirectChildren',
+        Filter = '*',
+        StartingIndex = 0,
+        RequestedCount = 100,
+        SortCriteria = ''
+    })
+    if not ok then
+        log.error("Could not browse Sonos favorites")
+        return
+    end
+
+    local presets, meta_by_id = upnp_services.parse_presets(body, art_base_for(device))
+    if not presets then
+        log.error("Could not read Sonos favorites: " .. tostring(meta_by_id))
+        return
+    end
+
+    device:set_field("presets", meta_by_id)
+    emit(device, 'main', capabilities.mediaPresets.presets(presets))
+    log.info(string.format("Loaded %d Sonos favorite(s)", #presets))
+end
+
+function upnp_services.play_preset(device, preset_id)
+    local presets = device:get_field("presets")
+    -- Favorites are only fetched on refresh, so a preset played before the
+    -- first refresh (or after they changed) needs a fresh browse.
+    if not (presets and presets[preset_id]) then
+        upnp_services.get_presets(device)
+        presets = device:get_field("presets")
+    end
+
+    local entry = presets and presets[preset_id]
+    if not entry then
+        log.error("Unknown preset: " .. tostring(preset_id))
+        return
+    end
+    play_uri(device, entry.uri, entry.meta)
+end
+
+-- ---------------------------------------------------------------------------
+-- Announcements (audioNotification)
+-- ---------------------------------------------------------------------------
+
+local function restore_snapshot(device, snap)
+    if not snap then
+        return
+    end
+    if snap.volume then
+        upnp_services.set_volume(device, snap.volume)
+    end
+    if snap.uri then
+        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+            { InstanceID = 0, CurrentURI = snap.uri, CurrentURIMetaData = snap.meta or '' })
+        local track = tonumber(snap.track)
+        if track and track > 0 then
+            self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'Seek',
+                { InstanceID = 0, Unit = 'TRACK_NR', Target = track })
+        end
+        -- Only seek to a real timestamp; TV and line-in report NOT_IMPLEMENTED.
+        if snap.position and snap.position:match("^%d+:%d%d:%d%d$") then
+            self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'Seek',
+                { InstanceID = 0, Unit = 'REL_TIME', Target = snap.position })
+        end
+    end
+    if snap.resume and snap.state == 'PLAYING' then
+        upnp_services.transport_play(device)
+    end
+    upnp_services.get_track_data(device)
+    upnp_services.get_transport_state(device)
+end
+
+-- Play a clip, then put back whatever was playing. `resume` decides whether
+-- playback restarts or just the transport is restored.
+function upnp_services.play_notification(device, uri, level, duration, resume)
+    if not uri then
+        return
+    end
+
+    local media = av_command(device, 'GetMediaInfo', { InstanceID = 0 })
+    local pos = av_command(device, 'GetPositionInfo', { InstanceID = 0 })
+    local transport = av_command(device, 'GetTransportInfo', { InstanceID = 0 })
+    local vol = rc_command(device, 'GetVolume', { InstanceID = 0, Channel = 'Master' })
+
+    local snap = {
+        uri = usable(media and media.GetMediaInfo and media.GetMediaInfo.CurrentURI),
+        meta = usable(media and media.GetMediaInfo and media.GetMediaInfo.CurrentURIMetaData),
+        track = usable(pos and pos.GetPositionInfo and pos.GetPositionInfo.Track),
+        position = usable(pos and pos.GetPositionInfo and pos.GetPositionInfo.RelTime),
+        state = transport and transport.GetTransportInfo and transport.GetTransportInfo.CurrentTransportState,
+        volume = vol and vol.GetVolume and vol.GetVolume.CurrentVolume,
+        resume = resume
+    }
+
+    if level then
+        upnp_services.set_volume(device, level)
+    end
+
+    self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+        { InstanceID = 0, CurrentURI = uri, CurrentURIMetaData = '' })
+    self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'Play', { InstanceID = 0, Speed = 1 })
+
+    local wait = tonumber(duration)
+    if wait and wait > 0 then
+        device.thread:call_with_delay(wait + 1, function()
+            restore_snapshot(device, snap)
+        end)
+        return
+    end
+
+    -- No duration given: poll until the clip stops, with a hard ceiling so a
+    -- stalled stream can't strand playback forever.
+    local waited = 0
+    local function poll()
+        waited = waited + 2
+        local info = av_command(device, 'GetTransportInfo', { InstanceID = 0 })
+        local state = info and info.GetTransportInfo and info.GetTransportInfo.CurrentTransportState
+        if state == 'STOPPED' or state == 'NO_MEDIA_PRESENT' or waited >= NOTIFICATION_MAX_SECONDS then
+            restore_snapshot(device, snap)
+        else
+            device.thread:call_with_delay(2, poll)
+        end
+    end
+    device.thread:call_with_delay(2, poll)
+end
+
+-- ---------------------------------------------------------------------------
+-- Group state / group volume (mediaGroup)
+-- ---------------------------------------------------------------------------
+
+local function grc_command(device, action, args)
+    return self_soap(device, GRC_CONTROL_PATH, GRC_SERVICE_TYPE, action, args)
+end
+
+function upnp_services.get_media_group(device)
+    local groups = collect_zone_groups(device)
+    if not groups then
+        return
+    end
+    local self_uuid = upnp_services.player_uuid(device)
+
+    for _, group in ipairs(groups) do
+        local contains_self, others = false, 0
+        for _, m in ipairs(group.members) do
+            if m.uuid == self_uuid then
+                contains_self = true
+            elseif not m.invisible then
+                others = others + 1
+            end
+        end
+        if contains_self then
+            local role = 'ungrouped'
+            if others > 0 then
+                role = (group.coordinator == self_uuid) and 'primary' or 'auxiliary'
+            end
+            emit(device, 'main', capabilities.mediaGroup.groupId(group.id or ''))
+            emit(device, 'main', capabilities.mediaGroup.groupPrimaryDeviceId(group.coordinator or ''))
+            emit(device, 'main', capabilities.mediaGroup.groupRole(role))
+            break
+        end
+    end
+
+    local ok, body = grc_command(device, 'GetGroupVolume', { InstanceID = 0 })
+    if ok and body then
+        local v = body:match("<CurrentVolume>(%d+)</CurrentVolume>")
+        if v then
+            emit(device, 'main', capabilities.mediaGroup.groupVolume(tonumber(v)))
+        end
+    end
+
+    ok, body = grc_command(device, 'GetGroupMute', { InstanceID = 0 })
+    if ok and body then
+        local m = body:match("<CurrentMute>(%d+)</CurrentMute>")
+        if m then
+            emit(device, 'main', capabilities.mediaGroup.groupMute(m == '1' and 'muted' or 'unmuted'))
+        end
+    end
+end
+
+function upnp_services.set_group_volume(device, vol)
+    vol = math.max(0, math.min(100, math.floor(tonumber(vol) or 0)))
+    if grc_command(device, 'SetGroupVolume', { InstanceID = 0, DesiredVolume = vol }) then
+        emit(device, 'main', capabilities.mediaGroup.groupVolume(vol))
+    end
+end
+
+function upnp_services.adjust_group_volume(device, delta)
+    local ok, body = grc_command(device, 'GetGroupVolume', { InstanceID = 0 })
+    local current = ok and body and tonumber(body:match("<CurrentVolume>(%d+)</CurrentVolume>"))
+    if current then
+        upnp_services.set_group_volume(device, current + delta)
+    end
+end
+
+function upnp_services.set_group_mute(device, muted)
+    if grc_command(device, 'SetGroupMute', { InstanceID = 0, DesiredMute = muted and 1 or 0 }) then
+        emit(device, 'main', capabilities.mediaGroup.groupMute(muted and 'muted' or 'unmuted'))
+    end
+end
+
+-- ---------------------------------------------------------------------------
+
 function upnp_services.refresh_components(device)
     for comp in pairs(switch_eqs) do
         upnp_services.get_switch_eq(device, comp)
@@ -639,6 +1167,9 @@ function upnp_services.refresh_components(device)
     upnp_services.get_mute(device)
     upnp_services.get_transport_state(device)
     upnp_services.get_group_state(device)
+    upnp_services.get_track_data(device)
+    upnp_services.get_media_group(device)
+    upnp_services.get_presets(device)
 end
 
 -- ---------------------------------------------------------------------------
@@ -728,6 +1259,18 @@ function upnp_services.avtransport_event_callback(device, sid, sequence, propert
     if inst.TransportState and inst.TransportState._attr then
         emit_transport_state(device, inst.TransportState._attr.val)
     end
+
+    -- Track metadata arrives as DIDL-Lite in the event value, so now-playing
+    -- updates without polling.
+    local track_didl = inst.CurrentTrackMetaData and inst.CurrentTrackMetaData._attr
+        and inst.CurrentTrackMetaData._attr.val
+    local current_uri = inst.AVTransportURI and inst.AVTransportURI._attr
+        and inst.AVTransportURI._attr.val
+    local current_didl = inst.AVTransportURIMetaData and inst.AVTransportURIMetaData._attr
+        and inst.AVTransportURIMetaData._attr.val
+    if track_didl or current_uri then
+        emit_track_data(device, track_didl, current_uri, current_didl)
+    end
 end
 
 -- Backward-compatible alias (older lifecycle code referenced event_callback).
@@ -743,11 +1286,17 @@ function upnp_services.discover_device(device)
 
     -- NOTE: a specific search target must include prefix (eg 'uuid:') for SSDP searches
     while waittime <= 3 do
+        -- Report what SSDP actually returned: "found nothing" and "found other
+        -- players but not this one" are very different failures.
+        local seen = {}
         upnp.discover(upnp_services.searchtarget, waittime, function(devobj)
-            if device.device_network_id == devobj.uuid then
+            table.insert(seen, tostring(devobj.uuid))
+            if id_matches(device.device_network_id, devobj.uuid) then
                 upnpdev = devobj
             end
         end)
+        log.info(string.format("discover attempt %d for %s: %d responder(s) [%s]",
+            waittime, tostring(device.device_network_id), #seen, table.concat(seen, ", ")))
         if upnpdev then
             return upnpdev
         end

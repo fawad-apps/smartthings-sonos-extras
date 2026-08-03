@@ -11,8 +11,18 @@ components:
         version: 1
       - id: mediaTrackControl
         version: 1
+      - id: audioTrackData
+        version: 1
+      - id: mediaPresets
+        version: 1
+      - id: mediaGroup
+        version: 1
+      - id: audioNotification
+        version: 1
       - id: refresh
         version: 1
+    categories:
+      - name: MediaPlayer
   - id: DialogLevel
     label: Dialog Level
     capabilities:
