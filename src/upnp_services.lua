@@ -712,8 +712,15 @@ function upnp_services.group_all(device, driver)
         return
     end
 
-    -- Make this soundbar the head of its own group first.
-    av_command(device, 'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 })
+    -- Only split off if this soundbar is a guest in someone else's group -
+    -- it has to lead its own group before others can join it. Doing it
+    -- unconditionally moved the soundbar onto its local queue, which killed
+    -- TV audio: turning Party Mode on mid-programme silenced the television
+    -- instead of sending its sound to the other rooms.
+    local state = upnp_services.group_state(groups, self_uuid)
+    if state and state.role == 'auxiliary' then
+        av_command(device, 'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 })
+    end
 
     local targets = upnp_services.group_targets(groups, self_uuid)
     local target_uri = "x-rincon:" .. self_uuid

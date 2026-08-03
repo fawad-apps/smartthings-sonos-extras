@@ -389,6 +389,32 @@ t.test("an event with no URI leaves the TV switch alone", function()
 end)
 
 -- ---------------------------------------------------------------------------
+-- Party Mode must not silence the television
+-- ---------------------------------------------------------------------------
+
+t.test("grouping does not split a soundbar that already leads its own group", function()
+    -- Verified live: BecomeCoordinatorOfStandaloneGroup moves the soundbar onto
+    -- its local queue, so calling it unconditionally killed TV audio - turning
+    -- Party Mode on mid-programme silenced the television instead of sending
+    -- its sound to the other rooms.
+    local device, calls = fake_player({ GetZoneGroupState = zone_group_response(STANDALONE) })
+    upnp_services.group_all(device)
+
+    t.falsy(contains(calls.commands, "BecomeCoordinatorOfStandaloneGroup"),
+        "already a coordinator, so no split")
+end)
+
+t.test("grouping does split a soundbar that is a guest in another group", function()
+    -- As a guest its transport belongs to that coordinator, so nobody could
+    -- join it until it heads its own group.
+    local device, calls = fake_player({ GetZoneGroupState = zone_group_response(ARC_IS_A_GUEST) })
+    upnp_services.group_all(device)
+
+    t.truthy(contains(calls.commands, "BecomeCoordinatorOfStandaloneGroup"),
+        "guest splits off first")
+end)
+
+-- ---------------------------------------------------------------------------
 -- TV mode
 -- ---------------------------------------------------------------------------
 
