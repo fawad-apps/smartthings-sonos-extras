@@ -932,7 +932,12 @@ local function didl_field(didl, tag)
         return nil
     end
     local pattern_tag = tag:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
-    local raw = didl:match("<" .. pattern_tag .. "[^>]*>(.-)</" .. pattern_tag .. ">")
+    -- The tag name has to end where it ends. "<upnp:album[^>]*>" happily
+    -- matches "<upnp:albumArtURI>", and the lazy body then ran on to the real
+    -- </upnp:album> at the far end of the item - so the album came back as the
+    -- art URL plus every element in between.
+    local raw = didl:match("<" .. pattern_tag .. ">(.-)</" .. pattern_tag .. ">")
+        or didl:match("<" .. pattern_tag .. "%s[^>]*>(.-)</" .. pattern_tag .. ">")
     if not usable(raw) then
         return nil
     end
@@ -1473,8 +1478,24 @@ function upnp_services.avtransport_event_callback(device, sid, sequence, propert
     local track_didl = lc_value(inst, 'CurrentTrackMetaData')
     local current_uri = lc_value(inst, 'AVTransportURI') or lc_value(inst, 'CurrentTrackURI')
     local current_didl = lc_value(inst, 'AVTransportURIMetaData')
-    if track_didl or current_uri then
+
+    if usable(track_didl) then
         emit_track_data(device, track_didl, current_uri, current_didl)
+    elseif current_uri then
+        -- Sonos announces the new URI before it has metadata for it. Emitting
+        -- on that replaced a real now-playing with "Unknown" and threw the
+        -- album art away - which is what the tile actually showed while music
+        -- was playing. A URI that names its own source (TV, line-in) is enough
+        -- on its own; anything else has to be asked for once Sonos catches up.
+        if source_from_uri(current_uri) then
+            emit_track_data(device, nil, current_uri, current_didl)
+        elseif not device:get_field("track_poll_pending") then
+            device:set_field("track_poll_pending", true)
+            device.thread:call_with_delay(1, function()
+                device:set_field("track_poll_pending", nil)
+                upnp_services.get_track_data(device)
+            end)
+        end
     end
 end
 

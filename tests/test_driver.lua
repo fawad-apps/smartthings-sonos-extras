@@ -250,6 +250,29 @@ t.test("build_track_data extracts title, artist and album from DIDL", function()
     t.eq(data.albumArtUrl, "http://192.168.2.109:1400/getaa?x=1", "album art")
 end)
 
+t.test("build_track_data does not let albumArtURI swallow the album", function()
+    -- Real Apple Music payload from the Arc. "<upnp:album[^>]*>" matched
+    -- "<upnp:albumArtURI>", so the album came back as the art URL followed by
+    -- every element up to the real </upnp:album>.
+    local didl = [[<DIDL-Lite><item id="-1" parentID="-1" restricted="true">]] ..
+        [[<res protocolInfo="sonos.com-http:*:audio/mp4:*" duration="0:03:32">]] ..
+        [[x-sonos-http:librarytrack%3aa.1440795737.mp4?sid=204&amp;flags=8232&amp;sn=8</res>]] ..
+        [[<r:streamContent></r:streamContent>]] ..
+        [[<upnp:albumArtURI>/getaa?s=1&amp;u=x-sonos-http%3alibrarytrack.mp4</upnp:albumArtURI>]] ..
+        [[<dc:title>Home Again</dc:title>]] ..
+        [[<upnp:class>object.item.audioItem.musicTrack</upnp:class>]] ..
+        [[<dc:creator>Michael Kiwanuka</dc:creator>]] ..
+        [[<upnp:album>Home Again</upnp:album></item></DIDL-Lite>]]
+    local data = upnp_services.build_track_data(didl, "x-sonos-http:librarytrack.mp4", nil,
+        "http://192.168.2.109:1400")
+
+    t.eq(data.title, "Home Again", "title")
+    t.eq(data.artist, "Michael Kiwanuka", "artist")
+    t.eq(data.album, "Home Again", "album is the album, not the art URL")
+    t.eq(data.albumArtUrl, "http://192.168.2.109:1400/getaa?s=1&u=x-sonos-http%3alibrarytrack.mp4",
+        "album art")
+end)
+
 t.test("build_track_data prefers streamContent for radio", function()
     local didl = [[<DIDL-Lite><item><dc:title>Station</dc:title>]] ..
         [[<r:streamContent>Artist - Song</r:streamContent></item></DIDL-Lite>]]

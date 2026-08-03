@@ -261,6 +261,48 @@ t.test("a refused container favorite is not followed by the queue switch", funct
 end)
 
 -- ---------------------------------------------------------------------------
+-- Now playing: a metadata-less event must not wipe the tile
+-- ---------------------------------------------------------------------------
+
+local function lastchange(body)
+    return { LastChange = "<Event><InstanceID val=\"0\">" .. body .. "</InstanceID></Event>" }
+end
+
+t.test("an event with a URI but no metadata does not emit Unknown", function()
+    -- Sonos announces the new URI before it has metadata for it. Emitting on
+    -- that replaced a real now-playing with "Unknown" and dropped the album
+    -- art - exactly what the tile showed while music was playing.
+    local device, calls = fake_player()
+    upnp_services.avtransport_event_callback(device, "sid", 1,
+        lastchange('<CurrentTrackURI val="x-sonos-http:librarytrack.mp4"/>'))
+
+    t.eq(#device.emitted, 0, "nothing emitted from a metadata-less event")
+    t.eq(#calls.deferred, 1, "the real track data is asked for instead")
+end)
+
+t.test("a URI that names its own source is emitted without a poll", function()
+    -- TV audio and line-in never carry metadata, so waiting for it would mean
+    -- the tile never says what the soundbar is playing.
+    local device, calls = fake_player()
+    upnp_services.avtransport_event_callback(device, "sid", 1,
+        lastchange('<AVTransportURI val="x-sonos-htastream:' .. ARC .. ':spdif"/>'))
+
+    t.eq(device.emitted[1].event.value.title, "TV Audio", "TV source named from the URI alone")
+    t.eq(#calls.deferred, 0, "no poll needed")
+end)
+
+t.test("an event carrying real metadata is emitted straight away", function()
+    local device, calls = fake_player()
+    local didl = "&lt;DIDL-Lite&gt;&lt;item&gt;&lt;dc:title&gt;Home Again&lt;/dc:title&gt;" ..
+        "&lt;dc:creator&gt;Michael Kiwanuka&lt;/dc:creator&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"
+    upnp_services.avtransport_event_callback(device, "sid", 1,
+        lastchange('<CurrentTrackMetaData val="' .. didl .. '"/>'))
+
+    t.eq(device.emitted[1].event.value.title, "Home Again", "title from the event")
+    t.eq(#calls.deferred, 0, "no poll when the event already had the metadata")
+end)
+
+-- ---------------------------------------------------------------------------
 -- TV mode
 -- ---------------------------------------------------------------------------
 
