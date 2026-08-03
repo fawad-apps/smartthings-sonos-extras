@@ -303,6 +303,54 @@ t.test("an event carrying real metadata is emitted straight away", function()
 end)
 
 -- ---------------------------------------------------------------------------
+-- TV Mode as a switch: the state has to follow the speaker, not our commands
+-- ---------------------------------------------------------------------------
+
+local function emitted_for(device, comp)
+    for i = #device.emitted, 1, -1 do
+        if device.emitted[i].component == comp then
+            return device.emitted[i].event
+        end
+    end
+    return nil
+end
+
+t.test("TV Mode reads on when the player is on its TV input", function()
+    local device = fake_player(nil, { "main", "TVMode" })
+    upnp_services.sync_tv_state(device, "x-sonos-htastream:" .. ARC .. ":spdif")
+    t.eq(emitted_for(device, "TVMode").value, "on", "TV input reads as on")
+end)
+
+t.test("TV Mode reads off on any other source", function()
+    local device = fake_player(nil, { "main", "TVMode" })
+    upnp_services.sync_tv_state(device, "x-sonos-http:librarytrack%3aa.1440795737.mp4")
+    t.eq(emitted_for(device, "TVMode").value, "off", "music reads as off")
+end)
+
+t.test("TV Mode follows a source change made outside SmartThings", function()
+    -- The switch has to be right when you change source from the Sonos app or
+    -- the TV remote, not just when we command it. The event already carries
+    -- the URI, so this costs no extra requests.
+    local device = fake_player(nil, { "main", "TVMode" })
+    upnp_services.avtransport_event_callback(device, "sid", 1,
+        lastchange('<AVTransportURI val="x-sonos-htastream:' .. ARC .. ':spdif"/>'))
+    t.eq(emitted_for(device, "TVMode").value, "on", "event moved the switch")
+
+    upnp_services.avtransport_event_callback(device, "sid", 2,
+        lastchange('<AVTransportURI val="x-rincon-queue:' .. ARC .. '#0"/>'))
+    t.eq(emitted_for(device, "TVMode").value, "off", "switching to the queue turns it off")
+end)
+
+t.test("an event with no URI leaves the TV switch alone", function()
+    -- A volume-only or transport-only event says nothing about the source;
+    -- emitting "off" on it would make the switch flicker.
+    local device = fake_player(nil, { "main", "TVMode" })
+    upnp_services.avtransport_event_callback(device, "sid", 1,
+        lastchange('<TransportState val="PLAYING"/>'))
+    t.falsy(emitted_for(device, "TVMode"), "no TV state emitted")
+end)
+
+-- ---------------------------------------------------------------------------
 -- TV mode
 -- ---------------------------------------------------------------------------
 

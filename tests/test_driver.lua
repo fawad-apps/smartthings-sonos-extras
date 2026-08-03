@@ -132,23 +132,43 @@ t.test("switch on the soundbar sets EQ, does not join a room", function()
     local handlers, spy = command_handlers_with_spy()
     local soundbar = stubs.device({ dni = ARC_SSDP_UUID, parent_device_id = HUB_DEVICE_ID })
     handlers.switch_on(nil, soundbar, { component = "NightMode" })
-    t.eq(spy.calls[1], "set_switch_eq", "NightMode routes to EQ")
+    t.eq(spy.calls[1], "set_switch", "NightMode routes to the switch dispatcher, not a room join")
 end)
 
 t.test("the momentary buttons route to their own actions", function()
-    -- All three are the same capability on different components, so a missed
-    -- branch silently flattens the EQ instead of doing what the button says.
+    -- Both are the same capability on different components, so a missed branch
+    -- silently flattens the EQ instead of doing what the button says.
     local handlers, spy = command_handlers_with_spy()
     local soundbar = stubs.device({ dni = ARC_SSDP_UUID, parent_device_id = HUB_DEVICE_ID })
 
-    handlers.push(nil, soundbar, { component = "TVMode" })
-    t.eq(spy.calls[1], "play_tv", "TV Mode switches the input")
-
     handlers.push(nil, soundbar, { component = "SyncRooms" })
-    t.eq(spy.calls[2], "sync_rooms", "Sync Rooms creates children")
+    t.eq(spy.calls[1], "sync_rooms", "Sync Rooms creates children")
 
     handlers.push(nil, soundbar, { component = "ResetEQ" })
-    t.eq(spy.calls[3], "reset_eq", "Reset EQ flattens")
+    t.eq(spy.calls[2], "reset_eq", "Reset EQ flattens")
+end)
+
+t.test("every switch component routes to its own action", function()
+    -- Five components share the switch capability. Falling through to the EQ
+    -- path with a component it has no config for is a nil index, i.e. a dead
+    -- switch - which is what adding Loudness would have done.
+    local handlers, spy = command_handlers_with_spy()
+    local soundbar = stubs.device({ dni = ARC_SSDP_UUID, parent_device_id = HUB_DEVICE_ID })
+
+    handlers.switch_on(nil, soundbar, { component = "TVMode" })
+    t.eq(spy.calls[1], "play_tv", "TV Mode on selects the TV input")
+
+    handlers.switch_off(nil, soundbar, { component = "TVMode" })
+    t.eq(spy.calls[2], "leave_tv", "TV Mode off re-reads the real source")
+
+    handlers.switch_on(nil, soundbar, { component = "PartyMode" })
+    t.eq(spy.calls[3], "group_all", "Party Mode groups")
+
+    handlers.switch_on(nil, soundbar, { component = "Loudness" })
+    t.eq(spy.calls[4], "set_switch", "Loudness goes through the switch dispatcher")
+
+    handlers.switch_on(nil, soundbar, { component = "NightMode" })
+    t.eq(spy.calls[5], "set_switch", "EQ switches go through the same dispatcher")
 end)
 
 t.test("switch on a room child joins the room", function()

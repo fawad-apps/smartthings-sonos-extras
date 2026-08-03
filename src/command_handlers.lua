@@ -11,15 +11,18 @@ local function is_room_child(device)
 end
 
 -- Switch handlers: a child device is a per-room group toggle; on the soundbar,
--- Party Mode groups/ungroups everyone, everything else is a RenderingControl
--- EQ toggle (Dialog / Night Mode / Surround Mode).
+-- Party Mode groups/ungroups everyone and TV Mode selects the TV input,
+-- everything else is a RenderingControl toggle (Dialog / Night Mode / Surround
+-- Mode / Loudness).
 function command_handlers.switch_on(driver, device, command)
     if is_room_child(device) then
         upnp_services.join_room(driver, device)
     elseif command.component == 'PartyMode' then
         upnp_services.group_all(device)
+    elseif command.component == 'TVMode' then
+        upnp_services.play_tv(device)
     else
-        upnp_services.set_switch_eq(device, command.component, true)
+        upnp_services.set_switch(device, command.component, true)
     end
 end
 
@@ -28,8 +31,10 @@ function command_handlers.switch_off(driver, device, command)
         upnp_services.leave_room(driver, device)
     elseif command.component == 'PartyMode' then
         upnp_services.ungroup_all(device)
+    elseif command.component == 'TVMode' then
+        upnp_services.leave_tv(device)
     else
-        upnp_services.set_switch_eq(device, command.component, false)
+        upnp_services.set_switch(device, command.component, false)
     end
 end
 
@@ -38,13 +43,13 @@ function command_handlers.set_level(driver, device, command)
     upnp_services.set_level(device, command.component, command.args.level)
 end
 
--- Momentary buttons: Sync Sonos Rooms creates per-room toggles, TV Mode puts
--- the soundbar back on its TV input, Reset EQ flattens the sliders.
+-- Momentary buttons: Sync Sonos Rooms creates per-room toggles, Reset EQ
+-- flattens the sliders. (TV Mode was one of these; it is a switch now, so it
+-- can show whether the soundbar is on its TV input and be used as a condition
+-- in a routine.)
 function command_handlers.push(driver, device, command)
     if command.component == 'SyncRooms' then
         upnp_services.sync_rooms(driver, device)
-    elseif command.component == 'TVMode' then
-        upnp_services.play_tv(device)
     else
         upnp_services.reset_eq(device)
     end

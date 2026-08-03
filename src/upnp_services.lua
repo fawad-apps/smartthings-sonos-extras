@@ -105,6 +105,14 @@ local switch_eqs = {
     DialogLevel = { eqTypes = { "SpeechEnhanceEnabled", "DialogLevel" } }
 }
 
+-- On/off settings that have their own actions rather than going through SetEQ.
+local switch_controls = {
+    Loudness = {
+        get = "GetLoudness", set = "SetLoudness",
+        arg = "DesiredLoudness", field = "CurrentLoudness", channel = "Master"
+    }
+}
+
 -- Custom slider capabilities show real EQ values (e.g. Bass +3), not a 0-100%
 -- dimmer. eqLevel covers -10..10; surroundLevel covers -15..15.
 local EQ_CAP = "autumnpepper05038.eqlevel"
@@ -372,6 +380,35 @@ function upnp_services.set_switch_eq(device, comp, on)
             emit(device, comp, switch_event_for_value(desired))
             return
         end
+    end
+end
+
+local function get_switch_control(device, comp)
+    local cfg = switch_controls[comp]
+    local response = rc_command(device, cfg.get, { InstanceID = 0, Channel = cfg.channel })
+    if response and response[cfg.get] then
+        emit(device, comp, switch_event_for_value(response[cfg.get][cfg.field]))
+    end
+end
+
+local function set_switch_control(device, comp, on)
+    local cfg = switch_controls[comp]
+    local args = { InstanceID = 0, Channel = cfg.channel }
+    args[cfg.arg] = on and 1 or 0
+    if rc_command(device, cfg.set, args) then
+        emit(device, comp, switch_event_for_value(on and 1 or 0))
+    end
+end
+
+-- Dispatcher for every plain on/off component that isn't handled elsewhere, so
+-- a new switch can't be routed into the EQ path and fail on a nil config.
+function upnp_services.set_switch(device, comp, on)
+    if switch_eqs[comp] then
+        upnp_services.set_switch_eq(device, comp, on)
+    elseif switch_controls[comp] then
+        set_switch_control(device, comp, on)
+    else
+        log.error("Unknown switch component: " .. tostring(comp))
     end
 end
 
@@ -745,6 +782,33 @@ function upnp_services.tv_uri(uuid)
     return "x-sonos-htastream:" .. uuid .. TV_STREAM_SUFFIX
 end
 
+-- True when this transport URI is the soundbar's TV input.
+function upnp_services.is_tv_uri(uri)
+    return uri ~= nil and uri:find("x-sonos-htastream:", 1, true) == 1
+end
+
+-- Keep the TV Mode switch honest. Every AVTransport event and every poll of
+-- the transport already carries the URI, so the switch tracks the real source
+-- for free - including when the source is changed from the Sonos app or the
+-- TV remote rather than from here.
+function upnp_services.sync_tv_state(device, uri)
+    if uri == nil then
+        return
+    end
+    emit(device, 'TVMode', upnp_services.is_tv_uri(uri)
+        and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+end
+
+-- Turning TV Mode off. The player refuses to stop its TV stream - Stop comes
+-- back as UPnP error 701 and it carries on playing - so there is nothing
+-- honest to do here except put the switch back to what the soundbar is really
+-- doing. Selecting any other source (a favorite, TV Mode on another speaker)
+-- is what actually leaves the TV input.
+function upnp_services.leave_tv(device)
+    log.info("TV Mode off: the player will not stop its TV input; re-reading the real source")
+    upnp_services.get_track_data(device)
+end
+
 -- Switch back to TV audio after music, a favorite or a group has taken the
 -- transport over.
 function upnp_services.play_tv(device)
@@ -770,6 +834,7 @@ function upnp_services.play_tv(device)
     end
 
     upnp_services.transport_play(device)
+    upnp_services.sync_tv_state(device, upnp_services.tv_uri(uuid))
     upnp_services.get_track_data(device)
     upnp_services.get_transport_state(device)
     log.info("TV mode: switched to TV audio")
@@ -1022,6 +1087,7 @@ function upnp_services.get_track_data(device)
     local current_uri = media and media.GetMediaInfo and media.GetMediaInfo.CurrentURI
     local current_didl = media and media.GetMediaInfo and media.GetMediaInfo.CurrentURIMetaData
     emit_track_data(device, track_didl, current_uri, current_didl)
+    upnp_services.sync_tv_state(device, current_uri)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1335,6 +1401,9 @@ function upnp_services.refresh_fast(device)
     for comp in pairs(switch_eqs) do
         upnp_services.get_switch_eq(device, comp)
     end
+    for comp in pairs(switch_controls) do
+        get_switch_control(device, comp)
+    end
     for comp in pairs(level_eqs) do
         get_level_eq(device, comp)
     end
@@ -1443,6 +1512,14 @@ function upnp_services.rendering_event_callback(device, sid, sequence, propertyl
         end
     end
 
+    -- Switches with their own actions report under their own element name.
+    for comp in pairs(switch_controls) do
+        local value = lc_value(inst, comp)
+        if value then
+            emit(device, comp, switch_event_for_value(value))
+        end
+    end
+
     -- EQ level sliders
     for eqType, comp in pairs(eqtype_to_level) do
         local value = lc_value(inst, eqType)
@@ -1486,6 +1563,10 @@ function upnp_services.avtransport_event_callback(device, sid, sequence, propert
     local track_didl = lc_value(inst, 'CurrentTrackMetaData')
     local current_uri = lc_value(inst, 'AVTransportURI') or lc_value(inst, 'CurrentTrackURI')
     local current_didl = lc_value(inst, 'AVTransportURIMetaData')
+
+    -- Free: the source is in the event we already received, so TV Mode tracks
+    -- changes made from the Sonos app or the TV remote too.
+    upnp_services.sync_tv_state(device, current_uri)
 
     if usable(track_didl) then
         emit_track_data(device, track_didl, current_uri, current_didl)

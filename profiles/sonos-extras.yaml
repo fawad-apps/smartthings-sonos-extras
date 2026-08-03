@@ -26,8 +26,10 @@ components:
   - id: TVMode
     label: TV Mode
     capabilities:
-      - id: momentary
+      - id: switch
         version: 1
+    categories:
+      - name: Switch
   - id: DialogLevel
     label: Dialog Level
     capabilities:
@@ -44,6 +46,13 @@ components:
       - name: Switch
   - id: SurroundMode
     label: Surround Mode
+    capabilities:
+      - id: switch
+        version: 1
+    categories:
+      - name: Switch
+  - id: Loudness
+    label: Loudness
     capabilities:
       - id: switch
         version: 1

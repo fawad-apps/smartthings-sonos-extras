@@ -24,10 +24,10 @@ This fork adds a full local control surface on top of the original EQ switches.
 
 | Component | What it does |
 |---|---|
-| Dialog Level, Night Mode, Surround Mode | The original EQ switches |
+| Dialog Level, Night Mode, Surround Mode, Loudness | On/off sound settings |
 | Bass, Treble, Sub Level, Height/Atmos Level, Surround Level | Sliders showing the real Sonos value (e.g. `+3`), not a 0–100 % dimmer |
 | Reset EQ | Flattens every slider to 0 |
-| TV Mode | Puts the soundbar back on its TV input, leaving a group first if it is only a guest in one |
+| TV Mode | Selects the soundbar's TV input, leaving a group first if it is only a guest in one. A switch rather than a button, so it also *shows* whether the soundbar is on TV audio and can be used as a condition in a routine — and it tracks the source even when you change it from the Sonos app or the TV remote, since the transport URI is in the events the driver already receives |
 | Party Mode | Groups every other visible speaker under the soundbar; off splits them again |
 | Sync Sonos Rooms | Creates one child device per other Sonos room, each an on/off toggle that joins or leaves the soundbar's group |
 
@@ -57,6 +57,12 @@ metadata is accepted by `SetAVTransportURI` and then fails at `Play` with UPnP
 error 501, and the service refuses to be browsed for the real station id (701).
 Such favorites are therefore left out of the preset list rather than offered as
 buttons that cannot work; the driver logs which ones it skipped and why.
+
+**TV Mode cannot be switched off.** The player refuses to stop its TV input —
+`Stop` comes back as UPnP error 701 and it keeps playing. Turning the switch off
+therefore re-reads the real source and puts the switch back where it was, rather
+than lying about what the speaker is doing. What actually leaves the TV input is
+selecting another source: playing a favorite, or joining another speaker's group.
 
 **Music-service favorites need that service linked to the household.** A
 favorite belonging to a service the household has no account for fails with UPnP
