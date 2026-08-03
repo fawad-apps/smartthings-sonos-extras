@@ -1332,24 +1332,29 @@ end
 
 -- Household topology, now-playing and favorites: the heavy half, several round
 -- trips including the two biggest payloads Sonos returns.
-function upnp_services.refresh_slow(device)
+--
+-- `user_asked` means someone pulled to refresh in the app, which is exactly
+-- what you do after adding a favorite in the Sonos app - so that path has to
+-- ignore the favorites cache or the new favorite wouldn't show up for 15
+-- minutes and refreshing would look broken.
+function upnp_services.refresh_slow(device, user_asked)
     local groups = collect_zone_groups(device)
     if groups then
         upnp_services.get_group_state(device, groups)
         upnp_services.get_media_group(device, groups)
     end
     upnp_services.get_track_data(device)
-    upnp_services.get_presets(device)
+    upnp_services.get_presets(device, user_asked)
 end
 
 -- A refresh is ~20 sequential requests, and everything the user does runs on
 -- this same thread - so a tap landing during one used to sit behind all of it.
 -- Answer with the cheap half immediately and let the rest run afterwards, where
 -- a queued command can get in front of it.
-function upnp_services.refresh_components(device)
+function upnp_services.refresh_components(device, user_asked)
     upnp_services.refresh_fast(device)
     device.thread:call_with_delay(1, function()
-        upnp_services.refresh_slow(device)
+        upnp_services.refresh_slow(device, user_asked)
     end)
 end
 

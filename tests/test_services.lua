@@ -218,6 +218,18 @@ t.test("favorites are not re-browsed on every refresh", function()
     t.eq(count_action("Browse"), 1, "second refresh reuses the cached favorites")
 end)
 
+t.test("a refresh the user asked for re-reads the favorites", function()
+    -- You add a favorite in the Sonos app, then pull to refresh here. Serving
+    -- that from a 15-minute cache would look like the driver was broken.
+    local device, calls = fake_player({ Browse = read_fixture("favorites_browse.xml") })
+    upnp_services.get_presets(device)
+
+    upnp_services.refresh_components(device, true)
+    calls.deferred[1].fn()
+
+    t.eq(count_action("Browse"), 2, "user refresh bypasses the favorites cache")
+end)
+
 t.test("playing an unknown preset still forces a fresh browse", function()
     -- Otherwise a favorite added after the cache filled could never be played.
     local device = fake_player({ Browse = read_fixture("favorites_browse.xml") })

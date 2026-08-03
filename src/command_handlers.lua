@@ -160,7 +160,10 @@ function command_handlers.refresh(driver, device)
     if is_room_child(device) then
         upnp_services.refresh_room(driver, device)
     else
-        upnp_services.refresh_components(device)
+        -- A refresh the user asked for re-reads the favorites even if the
+        -- cached copy is still young: refreshing right after adding one in the
+        -- Sonos app has to show it.
+        upnp_services.refresh_components(device, true)
     end
 end
 
