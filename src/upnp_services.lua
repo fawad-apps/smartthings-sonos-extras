@@ -5,8 +5,9 @@ local cosock = require "cosock"
 local socket = require "cosock.socket"
 local http = cosock.asyncify "socket.http"
 local ltn12 = require "ltn12"
-local tree = require "xmlhandler.tree"
-local xml2lua = require "xml2lua"
+-- No XML parser here on purpose: Sonos payloads embed escaped XML inside
+-- attribute values, which a tree parser chokes on. Everything is read with
+-- targeted patterns instead.
 
 local upnp_services = {}
 
@@ -503,55 +504,98 @@ end
 -- Speaker grouping (Party Mode)
 -- ---------------------------------------------------------------------------
 
--- Parse ZoneGroupTopology into a list of groups, each with a coordinator UUID
--- and its members (uuid / ip / port / name / invisible).
+local function parse_attrs(s)
+    local attrs = {}
+    for key, value in s:gmatch('([%w_]+)="([^"]*)"') do
+        attrs[key] = value
+    end
+    return attrs
+end
+
+-- Pure: ZoneGroupState XML in, a list of groups out, each with a coordinator
+-- UUID and its members (uuid / ip / port / name / invisible).
+--
+-- A home-theatre member wraps its sub and surrounds in nested <Satellite>
+-- elements, so ZoneGroupMember is NOT always self-closing. Only ZoneGroupMember
+-- elements are real group members - satellites are parts of one speaker and
+-- must never be commanded or offered as rooms to group with.
+function upnp_services.parse_zone_groups(xml)
+    if not xml or xml == '' then
+        return nil
+    end
+
+    local groups = {}
+    for group_attrs, body in xml:gmatch('<ZoneGroup%s+([^>]*)>(.-)</ZoneGroup>') do
+        local ga = parse_attrs(group_attrs)
+        local members = {}
+        for member_attrs in body:gmatch('<ZoneGroupMember%s+([^>]*)>') do
+            local a = parse_attrs(member_attrs)
+            if a.UUID then
+                local loc = a.Location or ''
+                table.insert(members, {
+                    uuid = a.UUID,
+                    ip = loc:match("http://([^:/]+)"),
+                    port = loc:match("http://[^:]+:(%d+)") or "1400",
+                    name = a.ZoneName,
+                    invisible = (a.Invisible == "1")
+                })
+            end
+        end
+        table.insert(groups, { id = ga.ID, coordinator = ga.Coordinator, members = members })
+    end
+
+    if #groups == 0 then
+        return nil
+    end
+    return groups
+end
+
+-- Every visible player that isn't us - the set Party Mode commands.
+function upnp_services.group_targets(groups, self_uuid)
+    local targets = {}
+    for _, group in ipairs(groups or {}) do
+        for _, m in ipairs(group.members) do
+            if m.uuid ~= self_uuid and m.ip and not m.invisible then
+                table.insert(targets, m)
+            end
+        end
+    end
+    return targets
+end
+
+-- Whether this player is grouped with anyone else, and in what role.
+function upnp_services.group_state(groups, self_uuid)
+    for _, group in ipairs(groups or {}) do
+        local contains_self, others = false, 0
+        for _, m in ipairs(group.members) do
+            if m.uuid == self_uuid then
+                contains_self = true
+            elseif not m.invisible then
+                others = others + 1
+            end
+        end
+        if contains_self then
+            local role = 'ungrouped'
+            if others > 0 then
+                role = (group.coordinator == self_uuid) and 'primary' or 'auxiliary'
+            end
+            return { group = group, grouped = others > 0, role = role, others = others }
+        end
+    end
+    return nil
+end
+
 local function collect_zone_groups(device)
     local response = command(device, upnp_services.zonetopology_service_id, 'GetZoneGroupState', {})
-    if not (response and response.GetZoneGroupState and response.GetZoneGroupState.ZoneGroupState) then
+    local xml = response and response.GetZoneGroupState and response.GetZoneGroupState.ZoneGroupState
+    if not xml then
         log.error("Could not read ZoneGroupState")
         return nil
     end
 
-    local res = tree:new()
-    local parser = xml2lua.parser(res)
-    parser:parse(response.GetZoneGroupState.ZoneGroupState)
-
-    local zgs = res and res.root and res.root.ZoneGroupState
-    if not (zgs and zgs.ZoneGroups and zgs.ZoneGroups.ZoneGroup) then
-        return nil
-    end
-
-    local raw_groups = zgs.ZoneGroups.ZoneGroup
-    if raw_groups._attr then
-        raw_groups = { raw_groups } -- single group -> array
-    end
-
-    local groups = {}
-    for _, g in ipairs(raw_groups) do
-        local members = {}
-        local raw_members = g.ZoneGroupMember
-        if raw_members then
-            if raw_members._attr then
-                raw_members = { raw_members }
-            end
-            for _, m in ipairs(raw_members) do
-                if m._attr and m._attr.UUID then
-                    local loc = m._attr.Location or ''
-                    table.insert(members, {
-                        uuid = m._attr.UUID,
-                        ip = loc:match("http://([^:/]+)"),
-                        port = loc:match("http://[^:]+:(%d+)") or "1400",
-                        name = m._attr.ZoneName,
-                        invisible = (m._attr.Invisible == "1")
-                    })
-                end
-            end
-        end
-        table.insert(groups, {
-            id = g._attr and g._attr.ID,
-            coordinator = g._attr and g._attr.Coordinator,
-            members = members
-        })
+    local groups = upnp_services.parse_zone_groups(xml)
+    if not groups then
+        log.error("ZoneGroupState contained no zone groups")
     end
     return groups
 end
@@ -571,19 +615,24 @@ function upnp_services.group_all(device)
     -- Make this soundbar the head of its own group first.
     av_command(device, 'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 })
 
-    local target = "x-rincon:" .. self_uuid
-    local count = 0
-    for _, group in ipairs(groups) do
-        for _, m in ipairs(group.members) do
-            if m.uuid ~= self_uuid and m.ip and not m.invisible then
-                if soap_post(m.ip, m.port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
-                        { InstanceID = 0, CurrentURI = target, CurrentURIMetaData = "" }) then
-                    count = count + 1
-                end
-            end
+    local targets = upnp_services.group_targets(groups, self_uuid)
+    local target_uri = "x-rincon:" .. self_uuid
+    local count, failed = 0, 0
+    for _, m in ipairs(targets) do
+        if soap_post(m.ip, m.port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+                { InstanceID = 0, CurrentURI = target_uri, CurrentURIMetaData = "" }) then
+            count = count + 1
+        else
+            failed = failed + 1
+            log.error(string.format("Party mode: could not group %s (%s)",
+                tostring(m.name), tostring(m.ip)))
         end
     end
-    log.info(string.format("Party mode ON: grouped %d player(s) under %s", count, tostring(self_uuid)))
+    log.info(string.format("Party mode ON: grouped %d of %d player(s) under %s",
+        count, #targets, tostring(self_uuid)))
+    if failed > 0 then
+        log.warn(string.format("Party mode: %d player(s) did not join", failed))
+    end
     set_party_switch(device, count > 0)
 end
 
@@ -596,18 +645,18 @@ function upnp_services.ungroup_all(device)
         return
     end
 
+    local targets = upnp_services.group_targets(groups, self_uuid)
     local count = 0
-    for _, group in ipairs(groups) do
-        for _, m in ipairs(group.members) do
-            if m.uuid ~= self_uuid and m.ip and not m.invisible then
-                if soap_post(m.ip, m.port, AV_CONTROL_PATH, AV_SERVICE_TYPE,
-                        'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 }) then
-                    count = count + 1
-                end
-            end
+    for _, m in ipairs(targets) do
+        if soap_post(m.ip, m.port, AV_CONTROL_PATH, AV_SERVICE_TYPE,
+                'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 }) then
+            count = count + 1
+        else
+            log.error(string.format("Party mode: could not ungroup %s (%s)",
+                tostring(m.name), tostring(m.ip)))
         end
     end
-    log.info(string.format("Party mode OFF: ungrouped %d player(s)", count))
+    log.info(string.format("Party mode OFF: ungrouped %d of %d player(s)", count, #targets))
     set_party_switch(device, false)
 end
 
@@ -617,22 +666,8 @@ function upnp_services.get_group_state(device)
     if not groups then
         return
     end
-    local self_uuid = upnp_services.player_uuid(device)
-    local grouped = false
-    for _, group in ipairs(groups) do
-        local contains_self, others = false, 0
-        for _, m in ipairs(group.members) do
-            if m.uuid == self_uuid then
-                contains_self = true
-            elseif not m.invisible then
-                others = others + 1
-            end
-        end
-        if contains_self and others > 0 then
-            grouped = true
-        end
-    end
-    set_party_switch(device, grouped)
+    local state = upnp_services.group_state(groups, upnp_services.player_uuid(device))
+    set_party_switch(device, state ~= nil and state.grouped)
 end
 
 -- ---------------------------------------------------------------------------
@@ -666,28 +701,27 @@ function upnp_services.sync_rooms(driver, device)
         end
     end
 
+    local rooms = upnp_services.group_targets(groups, self_uuid)
     local created = 0
-    for _, group in ipairs(groups) do
-        for _, m in ipairs(group.members) do
-            if m.uuid ~= self_uuid and not m.invisible then
-                local dni = self_uuid .. ":group:" .. m.uuid
-                if not existing[m.uuid] then
-                    local ok = driver:try_create_device({
-                        type = "LAN",
-                        device_network_id = dni,
-                        label = "Group: " .. (m.name or m.uuid),
-                        profile = "sonos-group-member",
-                        parent_device_id = device.id
-                    })
-                    if ok then
-                        created = created + 1
-                        existing[m.uuid] = true
-                    end
-                end
+    for _, m in ipairs(rooms) do
+        if not existing[m.uuid] then
+            local ok = driver:try_create_device({
+                type = "LAN",
+                device_network_id = self_uuid .. ":group:" .. m.uuid,
+                label = "Group: " .. (m.name or m.uuid),
+                profile = "sonos-group-member",
+                parent_device_id = device.id
+            })
+            if ok then
+                created = created + 1
+                existing[m.uuid] = true
+            else
+                log.error("Sync rooms: could not create toggle for " .. tostring(m.name))
             end
         end
     end
-    log.info(string.format("Sync rooms: created %d new room toggle(s)", created))
+    log.info(string.format("Sync rooms: %d room(s) visible, created %d new toggle(s)",
+        #rooms, created))
 end
 
 -- Resolve a child toggle -> (parent uuid, room ip, room port) from live topology.
@@ -1090,27 +1124,11 @@ function upnp_services.get_media_group(device)
     if not groups then
         return
     end
-    local self_uuid = upnp_services.player_uuid(device)
-
-    for _, group in ipairs(groups) do
-        local contains_self, others = false, 0
-        for _, m in ipairs(group.members) do
-            if m.uuid == self_uuid then
-                contains_self = true
-            elseif not m.invisible then
-                others = others + 1
-            end
-        end
-        if contains_self then
-            local role = 'ungrouped'
-            if others > 0 then
-                role = (group.coordinator == self_uuid) and 'primary' or 'auxiliary'
-            end
-            emit(device, 'main', capabilities.mediaGroup.groupId(group.id or ''))
-            emit(device, 'main', capabilities.mediaGroup.groupPrimaryDeviceId(group.coordinator or ''))
-            emit(device, 'main', capabilities.mediaGroup.groupRole(role))
-            break
-        end
+    local state = upnp_services.group_state(groups, upnp_services.player_uuid(device))
+    if state then
+        emit(device, 'main', capabilities.mediaGroup.groupId(state.group.id or ''))
+        emit(device, 'main', capabilities.mediaGroup.groupPrimaryDeviceId(state.group.coordinator or ''))
+        emit(device, 'main', capabilities.mediaGroup.groupRole(state.role))
     end
 
     local ok, body = grc_command(device, 'GetGroupVolume', { InstanceID = 0 })
@@ -1176,37 +1194,57 @@ end
 -- Eventing
 -- ---------------------------------------------------------------------------
 
--- Find the value of a LastChange child for the Master channel. The node may be
--- a single element or an array (Master/LF/RF).
-local function master_value(node)
-    if not node then
+-- LastChange is XML whose *attribute values* themselves contain escaped XML
+-- (DIDL-Lite, for track metadata). Handing that to a full XML parser blows up
+-- with "Unbalanced Tag (/DIDL-Lite)", which silently dropped every AVTransport
+-- event. The payload is a flat list of <Tag [channel="..."] val="..."/>, so
+-- read it directly. Attribute values never contain a literal > or " (they're
+-- entity-escaped), which is what makes this safe.
+--
+-- Returns { [tag] = { {val=..., channel=...}, ... } }.
+function upnp_services.parse_lastchange(raw)
+    if not raw or raw == '' then
         return nil
     end
-    if node._attr then
-        if node._attr.channel == nil or node._attr.channel == 'Master' then
-            return node._attr.val
+    local inst = raw:match("<InstanceID.->(.*)</InstanceID>") or raw
+
+    local events = {}
+    for tag, attrs in inst:gmatch("<([%w:_%-]+)([^>]*)/>") do
+        local val = attrs:match('val="(.-)"')
+        if val then
+            local entry = {
+                val = xml_unescape(val),
+                channel = attrs:match('channel="([^"]*)"')
+            }
+            local list = events[tag]
+            if list then
+                list[#list + 1] = entry
+            else
+                events[tag] = { entry }
+            end
         end
+    end
+    return events
+end
+
+-- Value for the Master channel, or for a tag that isn't reported per-channel.
+function upnp_services.lastchange_value(events, tag)
+    local list = events and events[tag]
+    if not list then
         return nil
     end
-    for _, entry in ipairs(node) do
-        if entry._attr and entry._attr.channel == 'Master' then
-            return entry._attr.val
+    for _, entry in ipairs(list) do
+        if entry.channel == nil or entry.channel == 'Master' then
+            return entry.val
         end
     end
     return nil
 end
 
+local lc_value = upnp_services.lastchange_value
+
 local function parse_lastchange(propertylist)
-    if not (propertylist and propertylist.LastChange) then
-        return nil
-    end
-    local res = tree:new()
-    local parser = xml2lua.parser(res)
-    parser:parse(propertylist.LastChange)
-    if res and res.root and res.root.Event and res.root.Event.InstanceID then
-        return res.root.Event.InstanceID
-    end
-    return nil
+    return upnp_services.parse_lastchange(propertylist and propertylist.LastChange)
 end
 
 function upnp_services.rendering_event_callback(device, sid, sequence, propertylist)
@@ -1218,34 +1256,34 @@ function upnp_services.rendering_event_callback(device, sid, sequence, propertyl
 
     -- EQ switches
     for eqType, comp in pairs(eqtype_to_switch) do
-        local node = inst[eqType]
-        if node and node._attr then
-            emit(device, comp, switch_event_for_value(node._attr.val))
+        local value = lc_value(inst, eqType)
+        if value then
+            emit(device, comp, switch_event_for_value(value))
         end
     end
 
     -- EQ level sliders
     for eqType, comp in pairs(eqtype_to_level) do
-        local node = inst[eqType]
-        if node and node._attr then
-            emit_level(device, comp, level_eqs[comp].cap, node._attr.val)
+        local value = lc_value(inst, eqType)
+        if value then
+            emit_level(device, comp, level_eqs[comp].cap, value)
         end
     end
 
     -- Bass / Treble (element name matches the component id)
     for comp, cfg in pairs(level_controls) do
-        local value = master_value(inst[comp])
+        local value = lc_value(inst, comp)
         if value then
             emit_level(device, comp, cfg.cap, value)
         end
     end
 
-    local vol = master_value(inst.Volume)
+    local vol = lc_value(inst, 'Volume')
     if vol then
         emit_volume(device, vol)
     end
 
-    local mute = master_value(inst.Mute)
+    local mute = lc_value(inst, 'Mute')
     if mute then
         emit_mute(device, tostring(mute) == '1')
     end
@@ -1256,18 +1294,17 @@ function upnp_services.avtransport_event_callback(device, sid, sequence, propert
     if not inst then
         return
     end
-    if inst.TransportState and inst.TransportState._attr then
-        emit_transport_state(device, inst.TransportState._attr.val)
+    local state = lc_value(inst, 'TransportState')
+    if state then
+        emit_transport_state(device, state)
     end
 
     -- Track metadata arrives as DIDL-Lite in the event value, so now-playing
-    -- updates without polling.
-    local track_didl = inst.CurrentTrackMetaData and inst.CurrentTrackMetaData._attr
-        and inst.CurrentTrackMetaData._attr.val
-    local current_uri = inst.AVTransportURI and inst.AVTransportURI._attr
-        and inst.AVTransportURI._attr.val
-    local current_didl = inst.AVTransportURIMetaData and inst.AVTransportURIMetaData._attr
-        and inst.AVTransportURIMetaData._attr.val
+    -- updates without polling. Fall back to CurrentTrackURI: on TV and line-in
+    -- the transport URI is only reported when the source actually changes.
+    local track_didl = lc_value(inst, 'CurrentTrackMetaData')
+    local current_uri = lc_value(inst, 'AVTransportURI') or lc_value(inst, 'CurrentTrackURI')
+    local current_didl = lc_value(inst, 'AVTransportURIMetaData')
     if track_didl or current_uri then
         emit_track_data(device, track_didl, current_uri, current_didl)
     end

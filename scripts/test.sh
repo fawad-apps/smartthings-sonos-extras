@@ -19,4 +19,9 @@ find src -name '*.lua' -print0 | xargs -0 -n1 luac -p
 echo "    all sources parse"
 
 echo "==> Running tests"
-lua tests/test_driver.lua
+status=0
+for suite in tests/test_*.lua; do
+    echo "--- $suite"
+    lua "$suite" || status=1
+done
+exit $status
