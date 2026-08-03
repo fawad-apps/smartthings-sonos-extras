@@ -1,4 +1,4 @@
-# Sonos Extras
+# Sonos Extras (Forked from and credit to https://github.com/rym002/smartthings-sonos-extras)
 
 Smartthings hub connected device to control Sonos 
 * Dialog Level
