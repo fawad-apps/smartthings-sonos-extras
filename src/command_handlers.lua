@@ -26,6 +26,11 @@ function command_handlers.set_level(driver, device, command)
     upnp_services.set_level(device, command.component, command.args.level)
 end
 
+-- Reset all EQ sliders to flat (0).
+function command_handlers.reset_eq(driver, device, command)
+    upnp_services.reset_eq(device)
+end
+
 -- Volume -------------------------------------------------------------------
 function command_handlers.set_volume(driver, device, command)
     upnp_services.set_volume(device, command.args.volume)

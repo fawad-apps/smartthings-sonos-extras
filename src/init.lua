@@ -18,8 +18,14 @@ local sonos_driver = Driver("Sonos Extras", {
             [capabilities.switch.commands.on.NAME] = command_handlers.switch_on,
             [capabilities.switch.commands.off.NAME] = command_handlers.switch_off
         },
-        [capabilities.switchLevel.ID] = {
-            [capabilities.switchLevel.commands.setLevel.NAME] = command_handlers.set_level
+        ["autumnpepper05038.eqlevel"] = {
+            ["setLevel"] = command_handlers.set_level
+        },
+        ["autumnpepper05038.surroundlevel"] = {
+            ["setLevel"] = command_handlers.set_level
+        },
+        [capabilities.momentary.ID] = {
+            [capabilities.momentary.commands.push.NAME] = command_handlers.reset_eq
         },
         [capabilities.audioVolume.ID] = {
             [capabilities.audioVolume.commands.setVolume.NAME] = command_handlers.set_volume,

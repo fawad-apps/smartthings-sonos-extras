@@ -36,17 +36,22 @@ local switch_eqs = {
     DialogLevel = { eqTypes = { "SpeechEnhanceEnabled", "DialogLevel" } }
 }
 
--- Slider-style EQ settings via SetEQ/GetEQ (switchLevel, 0-100% over a signed range).
+-- Custom slider capabilities show real EQ values (e.g. Bass +3), not a 0-100%
+-- dimmer. eqLevel covers -10..10; surroundLevel covers -15..15.
+local EQ_CAP = "autumnpepper05038.eqlevel"
+local SURROUND_CAP = "autumnpepper05038.surroundlevel"
+
+-- Slider-style EQ settings via SetEQ/GetEQ, reported as their actual signed value.
 local level_eqs = {
-    SubGain = { eqType = "SubGain", min = -10, max = 10 },
-    HeightLevel = { eqType = "HeightChannelLevel", min = -10, max = 10 },
-    SurroundLevel = { eqType = "SurroundLevel", min = -15, max = 15 }
+    SubGain = { eqType = "SubGain", min = -10, max = 10, cap = EQ_CAP },
+    HeightLevel = { eqType = "HeightChannelLevel", min = -10, max = 10, cap = EQ_CAP },
+    SurroundLevel = { eqType = "SurroundLevel", min = -15, max = 15, cap = SURROUND_CAP }
 }
 
 -- Slider-style settings via dedicated actions (Bass/Treble use Set/GetBass, not SetEQ).
 local level_controls = {
-    Bass = { get = "GetBass", set = "SetBass", arg = "DesiredBass", field = "CurrentBass", min = -10, max = 10 },
-    Treble = { get = "GetTreble", set = "SetTreble", arg = "DesiredTreble", field = "CurrentTreble", min = -10, max = 10 }
+    Bass = { get = "GetBass", set = "SetBass", arg = "DesiredBass", field = "CurrentBass", min = -10, max = 10, cap = EQ_CAP },
+    Treble = { get = "GetTreble", set = "SetTreble", arg = "DesiredTreble", field = "CurrentTreble", min = -10, max = 10, cap = EQ_CAP }
 }
 
 -- Reverse lookups so events can be routed back to the right component.
@@ -153,20 +158,9 @@ local function soap_post(ip, port, path, service_type, action, args)
     return true
 end
 
-local function round(n)
-    return math.floor(n + 0.5)
-end
-
-local function to_percent(cfg, value)
-    value = tonumber(value) or cfg.min
-    local pct = (value - cfg.min) / (cfg.max - cfg.min) * 100
-    return math.max(0, math.min(100, round(pct)))
-end
-
-local function from_percent(cfg, pct)
-    pct = tonumber(pct) or 0
-    local value = cfg.min + (pct / 100) * (cfg.max - cfg.min)
-    return math.max(cfg.min, math.min(cfg.max, round(value)))
+local function clamp(cfg, value)
+    value = math.floor(tonumber(value) or 0)
+    return math.max(cfg.min, math.min(cfg.max, value))
 end
 
 -- Sonos EQ values are historically 0/1, but newer models (e.g. Arc Ultra)
@@ -217,20 +211,25 @@ end
 -- Level sliders: EQ (Sub/Height/Surround) and dedicated (Bass/Treble)
 -- ---------------------------------------------------------------------------
 
+local function emit_level(device, comp, cap, value)
+    emit(device, comp, capabilities[cap].level(math.floor(tonumber(value) or 0)))
+end
+
 local function get_level_eq(device, comp)
     local cfg = level_eqs[comp]
     local response = rc_command(device, 'GetEQ', { InstanceID = 0, EQType = cfg.eqType })
     if response and response.GetEQ then
-        emit(device, comp, capabilities.switchLevel.level(to_percent(cfg, response.GetEQ.CurrentValue)))
+        emit_level(device, comp, cfg.cap, response.GetEQ.CurrentValue)
     end
 end
 
-local function set_level_eq(device, comp, pct)
+local function set_level_eq(device, comp, value)
     local cfg = level_eqs[comp]
+    value = clamp(cfg, value)
     local response = rc_command(device, 'SetEQ',
-        { InstanceID = 0, EQType = cfg.eqType, DesiredValue = from_percent(cfg, pct) })
+        { InstanceID = 0, EQType = cfg.eqType, DesiredValue = value })
     if response then
-        emit(device, comp, capabilities.switchLevel.level(tonumber(pct)))
+        emit_level(device, comp, cfg.cap, value)
     end
 end
 
@@ -238,28 +237,39 @@ local function get_level_control(device, comp)
     local cfg = level_controls[comp]
     local response = rc_command(device, cfg.get, { InstanceID = 0 })
     if response and response[cfg.get] then
-        emit(device, comp, capabilities.switchLevel.level(to_percent(cfg, response[cfg.get][cfg.field])))
+        emit_level(device, comp, cfg.cap, response[cfg.get][cfg.field])
     end
 end
 
-local function set_level_control(device, comp, pct)
+local function set_level_control(device, comp, value)
     local cfg = level_controls[comp]
+    value = clamp(cfg, value)
     local args = { InstanceID = 0 }
-    args[cfg.arg] = from_percent(cfg, pct)
+    args[cfg.arg] = value
     local response = rc_command(device, cfg.set, args)
     if response then
-        emit(device, comp, capabilities.switchLevel.level(tonumber(pct)))
+        emit_level(device, comp, cfg.cap, value)
     end
 end
 
 -- Dispatcher used by the setLevel command handler.
-function upnp_services.set_level(device, comp, pct)
+function upnp_services.set_level(device, comp, value)
     if level_eqs[comp] then
-        set_level_eq(device, comp, pct)
+        set_level_eq(device, comp, value)
     elseif level_controls[comp] then
-        set_level_control(device, comp, pct)
+        set_level_control(device, comp, value)
     else
         log.error("Unknown level component: " .. tostring(comp))
+    end
+end
+
+-- Reset all EQ level sliders to flat (0).
+function upnp_services.reset_eq(device)
+    for comp in pairs(level_eqs) do
+        set_level_eq(device, comp, 0)
+    end
+    for comp in pairs(level_controls) do
+        set_level_control(device, comp, 0)
     end
 end
 
@@ -569,7 +579,7 @@ function upnp_services.rendering_event_callback(device, sid, sequence, propertyl
     for eqType, comp in pairs(eqtype_to_level) do
         local node = inst[eqType]
         if node and node._attr then
-            emit(device, comp, capabilities.switchLevel.level(to_percent(level_eqs[comp], node._attr.val)))
+            emit_level(device, comp, level_eqs[comp].cap, node._attr.val)
         end
     end
 
@@ -577,7 +587,7 @@ function upnp_services.rendering_event_callback(device, sid, sequence, propertyl
     for comp, cfg in pairs(level_controls) do
         local value = master_value(inst[comp])
         if value then
-            emit(device, comp, capabilities.switchLevel.level(to_percent(cfg, value)))
+            emit_level(device, comp, cfg.cap, value)
         end
     end
 
