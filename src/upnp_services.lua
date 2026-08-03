@@ -1076,7 +1076,7 @@ function upnp_services.parse_presets(body, art_base)
         return nil, "browse returned no Result element"
     end
 
-    local presets, meta_by_id = {}, {}
+    local presets, meta_by_id, skipped = {}, {}, {}
     for item in didl:gmatch("<item.-</item>") do
         local id = item:match('id="([^"]*)"')
         local title = didl_field(item, "dc:title")
@@ -1085,29 +1085,30 @@ function upnp_services.parse_presets(body, art_base)
             local meta = didl_field(item, "r:resMD")
             local uri = didl_field(item, "res")
 
-            -- Sonos Radio favorites carry no <res>; they're container items, so
-            -- build the container URI from the id inside their metadata.
-            if not uri and meta and meta:match("<upnp:class>object%.container") then
-                local inner_id = meta:match('<item%s+id="([^"]*)"')
-                if inner_id then
-                    uri = "x-rincon-cpcontainer:" .. inner_id
-                end
-            end
-
-            local entry = { uri = uri, meta = meta, name = title }
-            if entry.uri then
-                meta_by_id[id] = entry
+            if uri then
+                meta_by_id[id] = { uri = uri, meta = meta, name = title }
                 table.insert(presets, {
                     id = id,
                     name = title,
                     imageUrl = absolute_art_url(art_base, didl_field(item, "upnp:albumArtURI")),
                     mediaSource = didl_field(item, "r:description")
                 })
+            else
+                -- A favorite with an empty <res> is a "shortcut" - Sonos Radio
+                -- stations are the usual case. Only the Sonos app can play one,
+                -- by resolving it through Sonos's cloud; the player will not do
+                -- it locally. Verified against the hardware: every URI that can
+                -- be built from such a favorite's metadata is accepted by
+                -- SetAVTransportURI and then fails at Play with error 501, and
+                -- the service refuses to be browsed for the real id (701). This
+                -- used to rebuild an "x-rincon-cpcontainer:" URI here, which
+                -- produced a preset button that could never work.
+                table.insert(skipped, title)
             end
         end
     end
 
-    return presets, meta_by_id
+    return presets, meta_by_id, skipped
 end
 
 -- Favorites change rarely but the Browse response is one of the biggest things
@@ -1134,10 +1135,17 @@ function upnp_services.get_presets(device, force)
         return
     end
 
-    local presets, meta_by_id = upnp_services.parse_presets(body, art_base_for(device))
+    local presets, meta_by_id, skipped = upnp_services.parse_presets(body, art_base_for(device))
     if not presets then
         log.error("Could not read Sonos favorites: " .. tostring(meta_by_id))
         return
+    end
+
+    if #skipped > 0 then
+        log.warn(string.format(
+            "Skipping %d favorite(s) with no playable resource - these are shortcuts " ..
+            "(Sonos Radio stations) that only the Sonos app can resolve: %s",
+            #skipped, table.concat(skipped, ", ")))
     end
 
     device:set_field("presets", meta_by_id)

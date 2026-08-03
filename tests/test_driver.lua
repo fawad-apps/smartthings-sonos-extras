@@ -165,9 +165,9 @@ end)
 t.test("parse_presets reads every favorite from a real response", function()
     local presets = upnp_services.parse_presets(read_fixture("favorites_browse.xml"))
     t.truthy(presets, "presets parsed")
-    -- All seven are playable. SmartThings' own driver only exposes the four
-    -- that carry a <res> element.
-    t.eq(#presets, 7, "favorite count")
+    -- Only the four carrying a <res> element. The other three are shortcuts
+    -- the player cannot resolve locally - see the skip test below.
+    t.eq(#presets, 4, "favorite count")
     for _, p in ipairs(presets) do
         t.truthy(p.id and p.id ~= "", "preset id for " .. tostring(p.name))
         t.truthy(p.name and p.name ~= "", "preset name")
@@ -190,16 +190,21 @@ t.test("parse_presets recognises container favorites", function()
     t.matches(meta_by_id["FV:2/2"].uri, "^x%-sonosapi%-hls%-static:", "track is a direct URI")
 end)
 
-t.test("parse_presets recovers Sonos Radio favorites that have no <res>", function()
-    -- These carry no <res> element; the play URI has to be rebuilt from the
-    -- container id inside their metadata, or they'd be dropped silently.
-    local presets, meta_by_id = upnp_services.parse_presets(read_fixture("favorites_browse.xml"))
-    local radio
+t.test("parse_presets skips shortcut favorites the player cannot play", function()
+    -- Sonos Radio favorites carry an empty <res>: only the Sonos app can play
+    -- them, by resolving the shortcut through Sonos's cloud. This used to
+    -- rebuild an "x-rincon-cpcontainer:" URI from their metadata, which the
+    -- hardware accepts on SetAVTransportURI and then fails at Play with error
+    -- 501 - a preset button that could never work. They are reported as
+    -- skipped instead, so the log says which ones and why.
+    local presets, _, skipped = upnp_services.parse_presets(read_fixture("favorites_browse.xml"))
     for _, p in ipairs(presets) do
-        if p.name == "Discover Sonos Radio" then radio = p end
+        t.falsy(p.name == "Discover Sonos Radio", "shortcut favorite is not offered as a preset")
     end
-    t.truthy(radio, "Sonos Radio favorite present")
-    t.matches(meta_by_id[radio.id].uri, "^x%-rincon%-cpcontainer:", "rebuilt container URI")
+    t.eq(#skipped, 3, "the three Sonos Radio shortcuts are reported")
+
+    local named = table.concat(skipped, ", ")
+    t.truthy(named:find("Discover Sonos Radio", 1, true), "skipped list names the favorite")
 end)
 
 t.test("parse_presets reports why it failed instead of returning empty", function()
