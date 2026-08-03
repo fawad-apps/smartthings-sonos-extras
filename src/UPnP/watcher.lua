@@ -29,6 +29,7 @@ local log = require "log"
 
 local m     -- multicast socket
 local u     -- unicast socket
+local exptimer  -- handle for the periodic expiration check, so shutdown can cancel it
 
 -- socket ip defs
 local multicast_ip = "239.255.255.250"
@@ -266,7 +267,7 @@ local function init(upnpdev)
   upnpdev.stdriver:register_channel_handler(m, watch_multicast, 'multicast')
   upnpdev.stdriver:register_channel_handler(u, watch_multicast, 'unicast')
   
-  upnpdev.stdriver:call_on_schedule(EXPIRATIONCHECKTIME, check_expirations, "Expiration check timer")
+  exptimer = upnpdev.stdriver:call_on_schedule(EXPIRATIONCHECKTIME, check_expirations, "Expiration check timer")
   log.info ('[upnp] Periodic expiration checker scheduled')
 
   initflag = true
@@ -310,6 +311,14 @@ local function shutdown(driver)
     sock:close()
   end
   m, u = nil, nil
+
+  -- shutdown clears initflag, so the next register() calls init() again and
+  -- schedules another expiration check. Without cancelling this one, every
+  -- hub IP change leaves an extra timer running for the life of the driver.
+  if exptimer then
+    pcall(function() driver:cancel_timer(exptimer) end)
+    exptimer = nil
+  end
 	initflag = false
   watchtable = {}
   

@@ -50,8 +50,13 @@ end
 function command_handlers.push(driver, device, command)
     if command.component == 'SyncRooms' then
         upnp_services.sync_rooms(driver, device)
-    else
+    elseif command.component == 'ResetEQ' then
         upnp_services.reset_eq(device)
+    else
+        -- Name the components explicitly. The old catch-all meant any new
+        -- momentary button silently flattened the EQ instead of doing nothing
+        -- visible - a surprising thing to discover by pressing it.
+        log.error("Unknown momentary component: " .. tostring(command.component))
     end
 end
 

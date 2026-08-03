@@ -415,6 +415,87 @@ t.test("grouping does split a soundbar that is a guest in another group", functi
 end)
 
 -- ---------------------------------------------------------------------------
+-- Room toggles must be set from what we did, not from a read-back
+-- ---------------------------------------------------------------------------
+
+-- A driver stub holding the soundbar plus one room-child toggle.
+local function driver_with_child(parent, room_uuid)
+    local child = stubs.device({
+        id = "child-" .. room_uuid,
+        dni = ARC .. ":group:" .. room_uuid,
+        parent_device_id = parent.id
+    })
+    return { get_devices = function() return { parent, child } end }, child
+end
+
+t.test("grouping sets the room toggles from the result, not a topology read-back", function()
+    -- ZoneGroupState is eventually consistent: read straight after the
+    -- grouping writes, it still describes the OLD layout, so a read-back
+    -- could set every toggle to the opposite of the truth - and cache that
+    -- stale topology for the next ten seconds on top.
+    local device = fake_player({
+        GetZoneGroupState = zone_group_response(
+            topology(ARC, { member(ARC, "Living Room"), member(BEDROOM, "Main Bedroom") })),
+        SetAVTransportURI = "<s:Envelope><s:Body/></s:Envelope>"
+    })
+    local driver, child = driver_with_child(device, BEDROOM)
+
+    upnp_services.group_all(device, driver)
+
+    t.eq(#child.emitted, 1, "the room toggle was set once")
+    t.eq(child.emitted[1].event.value, "on", "and set to joined, matching what we just did")
+end)
+
+t.test("ungrouping turns the room toggles off", function()
+    local device = fake_player({
+        GetZoneGroupState = zone_group_response(
+            topology(ARC, { member(ARC, "Living Room"), member(BEDROOM, "Main Bedroom") })),
+        BecomeCoordinatorOfStandaloneGroup = "<s:Envelope><s:Body/></s:Envelope>"
+    })
+    local driver, child = driver_with_child(device, BEDROOM)
+
+    upnp_services.ungroup_all(device, driver)
+
+    t.eq(child.emitted[#child.emitted].event.value, "off", "toggle off after ungrouping")
+end)
+
+t.test("a room that failed to group is not reported as joined", function()
+    -- SetAVTransportURI is unlisted, so every join fails.
+    local device = fake_player({
+        GetZoneGroupState = zone_group_response(
+            topology(ARC, { member(ARC, "Living Room"), member(BEDROOM, "Main Bedroom") }))
+    })
+    local driver, child = driver_with_child(device, BEDROOM)
+
+    upnp_services.group_all(device, driver)
+
+    t.eq(child.emitted[#child.emitted].event.value, "off", "failed join reads as off")
+end)
+
+-- ---------------------------------------------------------------------------
+-- Announcements must not restore to a previous clip
+-- ---------------------------------------------------------------------------
+
+t.test("a second announcement keeps the first snapshot instead of taping over it", function()
+    -- By the time the second call arrives the transport IS the first clip, so
+    -- taking a fresh snapshot would "restore" to the clip and lose the user's
+    -- music for good - and both chains would then race to restore.
+    local device = fake_player({ SetAVTransportURI = "<s:Envelope><s:Body/></s:Envelope>" })
+    device:set_field("upnpdevice", device:get_field("upnpdevice"))
+
+    upnp_services.play_notification(device, "http://example.com/one.mp3", 30, 5, true)
+    local first = device:get_field("notification")
+    t.truthy(first, "an announcement is in flight")
+    t.eq(first.seq, 1, "first sequence")
+
+    upnp_services.play_notification(device, "http://example.com/two.mp3", 40, 5, false)
+    local second = device:get_field("notification")
+    t.eq(second.seq, 2, "superseded, not started fresh")
+    t.eq(second.snap, first.snap, "the original snapshot is kept")
+    t.truthy(second.snap.resume, "a restore-only call cannot cancel a resume already asked for")
+end)
+
+-- ---------------------------------------------------------------------------
 -- TV mode
 -- ---------------------------------------------------------------------------
 

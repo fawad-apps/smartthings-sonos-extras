@@ -30,6 +30,13 @@ components:
         version: 1
     categories:
       - name: Switch
+  - id: PartyMode
+    label: Party Mode (group all)
+    capabilities:
+      - id: switch
+        version: 1
+    categories:
+      - name: Switch
   - id: DialogLevel
     label: Dialog Level
     capabilities:
@@ -44,13 +51,6 @@ components:
         version: 1
     categories:
       - name: Switch
-  - id: SurroundMode
-    label: Surround Mode
-    capabilities:
-      - id: switch
-        version: 1
-    categories:
-      - name: Switch
   - id: Loudness
     label: Loudness
     capabilities:
@@ -58,22 +58,17 @@ components:
         version: 1
     categories:
       - name: Switch
-  - id: PartyMode
-    label: Party Mode (group all)
+  - id: SurroundMode
+    label: Surround Mode
     capabilities:
       - id: switch
         version: 1
     categories:
       - name: Switch
-  - id: ResetEQ
-    label: Reset EQ to Flat
+  - id: SurroundLevel
+    label: Surround Level
     capabilities:
-      - id: momentary
-        version: 1
-  - id: SyncRooms
-    label: Sync Sonos Rooms
-    capabilities:
-      - id: momentary
+      - id: autumnpepper05038.surroundlevel
         version: 1
   - id: Bass
     label: Bass
@@ -95,8 +90,13 @@ components:
     capabilities:
       - id: autumnpepper05038.eqlevel
         version: 1
-  - id: SurroundLevel
-    label: Surround Level
+  - id: ResetEQ
+    label: Reset EQ to Flat
     capabilities:
-      - id: autumnpepper05038.surroundlevel
+      - id: momentary
+        version: 1
+  - id: SyncRooms
+    label: Sync Sonos Rooms
+    capabilities:
+      - id: momentary
         version: 1

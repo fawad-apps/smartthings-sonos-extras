@@ -148,16 +148,26 @@ local function startup(driver, device, upnpdev)
     upnp_services.emit_static_capabilities(device)
     upnp_services.refresh_components(device)
 
-    -- Create the per-room toggles without anyone having to find and press the
-    -- Sync Sonos Rooms button first. Deferred so it lands behind the refresh
-    -- rather than adding another topology fetch to startup, and guarded so a
-    -- failure here cannot take the rest of startup with it.
-    device.thread:call_with_delay(15, function()
-        local ok, err = pcall(upnp_services.sync_rooms, driver, device)
-        if not ok then
-            log.warn("Automatic room sync failed: " .. tostring(err))
-        end
-    end)
+    -- Create the per-room toggles once, so nobody has to find and press Sync
+    -- Sonos Rooms first. Only ever once: this runs on every driver start, and
+    -- without the flag it would recreate toggles the user had deliberately
+    -- deleted, every single deploy. The button is there to re-run it on demand.
+    if not device:get_field("rooms_autosynced") then
+        device.thread:call_with_delay(15, function()
+            -- Re-check on the way in, not just on the way out: startup can run
+            -- more than once during a single driver start, and both timers
+            -- would otherwise fire a full topology fetch each.
+            if device:get_field("rooms_autosynced") then
+                return
+            end
+            local ok, err = pcall(upnp_services.sync_rooms, driver, device)
+            if ok then
+                device:set_field("rooms_autosynced", true, { persist = true })
+            else
+                log.warn("Automatic room sync failed: " .. tostring(err))
+            end
+        end)
+    end
 end
 
 -- Let upnp_services fully re-initialise a device it reacquires on demand.

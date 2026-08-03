@@ -131,13 +131,10 @@ local level_controls = {
     Treble = { get = "GetTreble", set = "SetTreble", arg = "DesiredTreble", field = "CurrentTreble", min = -10, max = 10, cap = EQ_CAP }
 }
 
--- Reverse lookups so events can be routed back to the right component.
-local eqtype_to_switch = {}
-for comp, cfg in pairs(switch_eqs) do
-    for _, eqType in ipairs(cfg.eqTypes) do
-        eqtype_to_switch[eqType] = comp
-    end
-end
+-- Reverse lookup so events can be routed back to the right component. (There
+-- is deliberately no such table for the switch EQs: Dialog Level is backed by
+-- two eqTypes at once, so events resolve it by walking that component's own
+-- list in priority order instead.)
 local eqtype_to_level = {}
 for comp, cfg in pairs(level_eqs) do
     eqtype_to_level[cfg.eqType] = comp
@@ -576,6 +573,44 @@ function upnp_services.emit_static_capabilities(device)
     emit(device, 'main', capabilities.mediaTrackControl.supportedTrackControlCommands({ "nextTrack", "previousTrack" }))
 end
 
+-- Visit each room-child toggle belonging to this soundbar, handing the callback
+-- the child and the room uuid its DNI names.
+local function each_room_child(driver, parent, fn)
+    local prefix = upnp_services.player_uuid(parent) .. ":group:"
+    for _, d in ipairs(driver:get_devices()) do
+        local dni = d.device_network_id or ""
+        if dni:sub(1, #prefix) == prefix then
+            fn(d, dni:sub(#prefix + 1))
+        end
+    end
+end
+
+local function set_room_switch(child, on)
+    emit(child, 'main', on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+end
+
+-- Set the room toggles from what we just did, rather than reading the topology
+-- back. ZoneGroupState is eventually consistent: read microseconds after the
+-- grouping writes it still describes the old layout, so a read-back could set
+-- every toggle to the opposite of the truth - and worse, cache that stale
+-- topology for the next ten seconds.
+local function apply_room_results(driver, parent, joined)
+    each_room_child(driver, parent, function(child, room_uuid)
+        local result = joined[room_uuid]
+        if result ~= nil then
+            set_room_switch(child, result)
+        end
+    end)
+end
+
+-- Re-read the grouping state of every room child. Only safe when no grouping
+-- command is in flight - use apply_room_results straight after a change.
+function upnp_services.refresh_room_children(driver, parent)
+    each_room_child(driver, parent, function(child)
+        upnp_services.refresh_room(driver, child)
+    end)
+end
+
 -- ---------------------------------------------------------------------------
 -- Speaker grouping (Party Mode)
 -- ---------------------------------------------------------------------------
@@ -707,6 +742,10 @@ end
 -- optional and only used to bring the per-room toggles in line afterwards.
 function upnp_services.group_all(device, driver)
     local self_uuid = upnp_services.player_uuid(device)
+    -- Decide from a fresh topology: a cached one can be up to TOPOLOGY_TTL old,
+    -- and "am I a guest in someone else's group" is exactly the fact that goes
+    -- stale when the soundbar was regrouped a moment ago.
+    upnp_services.invalidate_topology(device)
     local groups = collect_zone_groups(device)
     if not groups then
         return
@@ -725,12 +764,15 @@ function upnp_services.group_all(device, driver)
     local targets = upnp_services.group_targets(groups, self_uuid)
     local target_uri = "x-rincon:" .. self_uuid
     local count, failed = 0, 0
+    local joined = {}
     for _, m in ipairs(targets) do
         if soap_post(m.ip, m.port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
                 { InstanceID = 0, CurrentURI = target_uri, CurrentURIMetaData = "" }) then
             count = count + 1
+            joined[m.uuid] = true
         else
             failed = failed + 1
+            joined[m.uuid] = false
             log.error(string.format("Party mode: could not group %s (%s)",
                 tostring(m.name), tostring(m.ip)))
         end
@@ -743,7 +785,7 @@ function upnp_services.group_all(device, driver)
     upnp_services.invalidate_topology(device)
     set_party_switch(device, count > 0)
     if driver then
-        upnp_services.refresh_room_children(driver, device)
+        apply_room_results(driver, device, joined)
     end
 end
 
@@ -758,10 +800,12 @@ function upnp_services.ungroup_all(device, driver)
 
     local targets = upnp_services.group_targets(groups, self_uuid)
     local count = 0
+    local joined = {}
     for _, m in ipairs(targets) do
         if soap_post(m.ip, m.port, AV_CONTROL_PATH, AV_SERVICE_TYPE,
                 'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 }) then
             count = count + 1
+            joined[m.uuid] = false
         else
             log.error(string.format("Party mode: could not ungroup %s (%s)",
                 tostring(m.name), tostring(m.ip)))
@@ -771,7 +815,7 @@ function upnp_services.ungroup_all(device, driver)
     upnp_services.invalidate_topology(device)
     set_party_switch(device, false)
     if driver then
-        upnp_services.refresh_room_children(driver, device)
+        apply_room_results(driver, device, joined)
     end
 end
 
@@ -868,17 +912,6 @@ local function find_device(driver, device_id)
         end
     end
     return nil
-end
-
--- Re-read the grouping state of every room child, so the per-room toggles and
--- the Party Mode switch cannot disagree about the same group.
-function upnp_services.refresh_room_children(driver, parent)
-    for _, d in ipairs(driver:get_devices()) do
-        if d.device_network_id and d.device_network_id:find(":group:", 1, true)
-            and d.parent_device_id == parent.id then
-            upnp_services.refresh_room(driver, d)
-        end
-    end
 end
 
 -- Create a child toggle device for every other visible Sonos room.
@@ -979,9 +1012,11 @@ function upnp_services.join_room(driver, child)
         upnp_services.invalidate_topology(parent)
     end
     emit(child, 'main', ok and capabilities.switch.switch.on() or capabilities.switch.switch.off())
-    -- Joining a room changes the soundbar's group, so Party Mode has to agree.
-    if parent then
-        upnp_services.get_group_state(parent)
+    -- Party Mode has to agree, but do not read the topology back for it: it is
+    -- eventually consistent and would still describe the pre-join layout. On
+    -- success the soundbar is grouped by construction.
+    if parent and ok then
+        set_party_switch(parent, true)
     end
 end
 
@@ -996,8 +1031,14 @@ function upnp_services.leave_room(driver, child)
         upnp_services.invalidate_topology(parent)
     end
     emit(child, 'main', capabilities.switch.switch.off())
+    -- Leaving is the one case that cannot be inferred - other rooms may still
+    -- be grouped with the soundbar - so read it, but only once the topology has
+    -- had a moment to settle.
     if parent then
-        upnp_services.get_group_state(parent)
+        parent.thread:call_with_delay(3, function()
+            upnp_services.invalidate_topology(parent)
+            upnp_services.get_group_state(parent)
+        end)
     end
 end
 
@@ -1353,9 +1394,32 @@ end
 
 -- Play a clip, then put back whatever was playing. `resume` decides whether
 -- playback restarts or just the transport is restored.
+--
+-- A second announcement arriving while the first clip is still playing must
+-- NOT take its own snapshot: the transport is the first clip by then, so it
+-- would "restore" to the clip and the original source would be lost for good -
+-- and both restore chains would run, the later one winning. Instead the clip
+-- in flight is superseded: the original snapshot is kept, only the newest
+-- chain restores, and `resume` is or-ed so a restore-only call arriving after
+-- a resume call cannot cancel the resume the user asked for.
+local NOTIFICATION_FIELD = "notification"
+
 function upnp_services.play_notification(device, uri, level, duration, resume)
     if not uri then
         return
+    end
+
+    local pending = device:get_field(NOTIFICATION_FIELD)
+    if pending then
+        local claim = {
+            seq = pending.seq + 1,
+            snap = pending.snap,
+            level = pending.level
+        }
+        claim.snap.resume = pending.snap.resume or resume
+        device:set_field(NOTIFICATION_FIELD, claim)
+        log.info("Announcement superseded one already playing; keeping the first snapshot")
+        return upnp_services.finish_notification(device, uri, duration, claim.seq)
     end
 
     local media = av_command(device, 'GetMediaInfo', { InstanceID = 0 })
@@ -1373,8 +1437,36 @@ function upnp_services.play_notification(device, uri, level, duration, resume)
         resume = resume
     }
 
+    device:set_field(NOTIFICATION_FIELD, { seq = 1, snap = snap, level = level })
+
     if level then
         upnp_services.set_volume(device, level)
+    end
+
+    return upnp_services.finish_notification(device, uri, duration, 1)
+end
+
+-- Play the clip and arrange for exactly one restore. `seq` identifies this
+-- announcement; a chain whose seq is no longer the current one has been
+-- superseded and must do nothing, or two chains would both restore.
+function upnp_services.finish_notification(device, uri, duration, seq)
+    local function current()
+        local pending = device:get_field(NOTIFICATION_FIELD)
+        return pending and pending.seq == seq and pending or nil
+    end
+
+    local function finish()
+        local pending = current()
+        if not pending then
+            return -- superseded; the newer chain owns the restore
+        end
+        -- Clear only after restoring: restore_snapshot is several more round
+        -- trips, and an announcement arriving during them would otherwise see
+        -- no owner and snapshot a half-restored transport.
+        restore_snapshot(device, pending.snap)
+        if current() then
+            device:set_field(NOTIFICATION_FIELD, nil)
+        end
     end
 
     self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
@@ -1383,21 +1475,28 @@ function upnp_services.play_notification(device, uri, level, duration, resume)
 
     local wait = tonumber(duration)
     if wait and wait > 0 then
-        device.thread:call_with_delay(wait + 1, function()
-            restore_snapshot(device, snap)
-        end)
+        device.thread:call_with_delay(wait + 1, finish)
         return
     end
 
     -- No duration given: poll until the clip stops, with a hard ceiling so a
-    -- stalled stream can't strand playback forever.
-    local waited = 0
+    -- stalled stream can't strand playback forever. Require the clip to have
+    -- been heard playing once before believing a STOPPED, or the first poll can
+    -- catch it still starting up and cut it off.
+    local waited, started = 0, false
     local function poll()
+        if not current() then
+            return
+        end
         waited = waited + 2
         local info = av_command(device, 'GetTransportInfo', { InstanceID = 0 })
         local state = info and info.GetTransportInfo and info.GetTransportInfo.CurrentTransportState
-        if state == 'STOPPED' or state == 'NO_MEDIA_PRESENT' or waited >= NOTIFICATION_MAX_SECONDS then
-            restore_snapshot(device, snap)
+        if state == 'PLAYING' or state == 'TRANSITIONING' then
+            started = true
+        end
+        local stopped = (state == 'STOPPED' or state == 'NO_MEDIA_PRESENT')
+        if (started and stopped) or waited >= NOTIFICATION_MAX_SECONDS then
+            finish()
         else
             device.thread:call_with_delay(2, poll)
         end
