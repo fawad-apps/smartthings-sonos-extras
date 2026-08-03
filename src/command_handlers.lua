@@ -3,10 +3,17 @@ local upnp_services = require "upnp_services"
 
 local command_handlers = {}
 
--- Switch handlers: Party Mode groups/ungroups speakers; everything else is
--- a RenderingControl EQ toggle (Dialog / Night Mode / Surround Mode).
+local function is_room_child(device)
+    return device.parent_device_id ~= nil and device.parent_device_id ~= ''
+end
+
+-- Switch handlers: a child device is a per-room group toggle; on the soundbar,
+-- Party Mode groups/ungroups everyone, everything else is a RenderingControl
+-- EQ toggle (Dialog / Night Mode / Surround Mode).
 function command_handlers.switch_on(driver, device, command)
-    if command.component == 'PartyMode' then
+    if is_room_child(device) then
+        upnp_services.join_room(driver, device)
+    elseif command.component == 'PartyMode' then
         upnp_services.group_all(device)
     else
         upnp_services.set_switch_eq(device, command.component, true)
@@ -14,7 +21,9 @@ function command_handlers.switch_on(driver, device, command)
 end
 
 function command_handlers.switch_off(driver, device, command)
-    if command.component == 'PartyMode' then
+    if is_room_child(device) then
+        upnp_services.leave_room(driver, device)
+    elseif command.component == 'PartyMode' then
         upnp_services.ungroup_all(device)
     else
         upnp_services.set_switch_eq(device, command.component, false)
@@ -26,9 +35,13 @@ function command_handlers.set_level(driver, device, command)
     upnp_services.set_level(device, command.component, command.args.level)
 end
 
--- Reset all EQ sliders to flat (0).
-function command_handlers.reset_eq(driver, device, command)
-    upnp_services.reset_eq(device)
+-- Momentary buttons: Sync Sonos Rooms creates per-room toggles; Reset EQ flattens.
+function command_handlers.push(driver, device, command)
+    if command.component == 'SyncRooms' then
+        upnp_services.sync_rooms(driver, device)
+    else
+        upnp_services.reset_eq(device)
+    end
 end
 
 -- Volume -------------------------------------------------------------------
@@ -91,7 +104,11 @@ end
 
 -- Refresh ------------------------------------------------------------------
 function command_handlers.refresh(driver, device)
-    upnp_services.refresh_components(device)
+    if is_room_child(device) then
+        upnp_services.refresh_room(driver, device)
+    else
+        upnp_services.refresh_components(device)
+    end
 end
 
 return command_handlers

@@ -6,6 +6,10 @@ local upnp = require "UPnP"
 
 lifecycle.SUBSCRIBETIME = 86400
 
+local function is_room_child(device)
+    return device.parent_device_id ~= nil and device.parent_device_id ~= ''
+end
+
 -- Subscribe to both RenderingControl (EQ / volume / mute) and AVTransport
 -- (playback state). Each subscription gets its own SID and callback.
 local function subscribe_device(device)
@@ -72,6 +76,11 @@ end
 
 function lifecycle.device_added(driver, device)
     log.info("device_added")
+    if is_room_child(device) then
+        device:online()
+        upnp_services.refresh_room(driver, device)
+        return
+    end
     local id = device.device_network_id
     local upnpdev = discovery.popNewlyAdded(id)
     startup(driver, device, upnpdev)
@@ -80,6 +89,10 @@ end
 function lifecycle.device_removed(driver, device)
     log.info("device_removed")
     log.info("<" .. device.id .. "> removed")
+
+    if is_room_child(device) then
+        return
+    end
 
     local upnpdev = device:get_field("upnpdevice")
 
@@ -93,6 +106,11 @@ end
 
 function lifecycle.device_init(driver, device)
     log.info("device_init")
+    if is_room_child(device) then
+        device:online()
+        upnp_services.refresh_room(driver, device)
+        return
+    end
     local upnpdev = device:get_field("upnpdevice")
 
     if upnpdev == nil then -- if nil, then this handler was called to initialize an existing device (eg driver reinstall)

@@ -504,6 +504,124 @@ function upnp_services.get_group_state(device)
 end
 
 -- ---------------------------------------------------------------------------
+-- Per-room grouping (child devices, one on/off toggle per other Sonos room)
+-- ---------------------------------------------------------------------------
+
+local function find_device(driver, device_id)
+    for _, d in ipairs(driver:get_devices()) do
+        if d.id == device_id then
+            return d
+        end
+    end
+    return nil
+end
+
+-- Create a child toggle device for every other visible Sonos room.
+function upnp_services.sync_rooms(driver, device)
+    local self_uuid = device.device_network_id
+    local groups = collect_zone_groups(device)
+    if not groups then
+        return
+    end
+
+    local existing = {}
+    for _, d in ipairs(driver:get_devices()) do
+        existing[d.device_network_id] = true
+    end
+
+    local created = 0
+    for _, group in ipairs(groups) do
+        for _, m in ipairs(group.members) do
+            if m.uuid ~= self_uuid and not m.invisible then
+                local dni = self_uuid .. ":group:" .. m.uuid
+                if not existing[dni] then
+                    local ok = driver:try_create_device({
+                        type = "LAN",
+                        device_network_id = dni,
+                        label = "Group: " .. (m.name or m.uuid),
+                        profile = "sonos-group-member",
+                        parent_device_id = device.id
+                    })
+                    if ok then
+                        created = created + 1
+                        existing[dni] = true
+                    end
+                end
+            end
+        end
+    end
+    log.info(string.format("Sync rooms: created %d new room toggle(s)", created))
+end
+
+-- Resolve a child toggle -> (parent uuid, room ip, room port) from live topology.
+local function room_target(driver, child)
+    local room_uuid = child.device_network_id:match(":group:(.+)")
+    local parent = find_device(driver, child.parent_device_id)
+    if not (room_uuid and parent) then
+        return nil
+    end
+    local groups = collect_zone_groups(parent)
+    if not groups then
+        return nil
+    end
+    for _, group in ipairs(groups) do
+        for _, m in ipairs(group.members) do
+            if m.uuid == room_uuid and m.ip then
+                return parent.device_network_id, m.ip, m.port
+            end
+        end
+    end
+    return nil
+end
+
+function upnp_services.join_room(driver, child)
+    local parent_uuid, ip, port = room_target(driver, child)
+    if not ip then
+        log.error("join_room: room not found in topology")
+        return
+    end
+    local ok = soap_post(ip, port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+        { InstanceID = 0, CurrentURI = "x-rincon:" .. parent_uuid, CurrentURIMetaData = "" })
+    emit(child, 'main', ok and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+end
+
+function upnp_services.leave_room(driver, child)
+    local _, ip, port = room_target(driver, child)
+    if ip then
+        soap_post(ip, port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'BecomeCoordinatorOfStandaloneGroup',
+            { InstanceID = 0 })
+    end
+    emit(child, 'main', capabilities.switch.switch.off())
+end
+
+-- Reflect whether a room is currently grouped with the soundbar.
+function upnp_services.refresh_room(driver, child)
+    local room_uuid = child.device_network_id:match(":group:(.+)")
+    local parent = find_device(driver, child.parent_device_id)
+    if not (room_uuid and parent) then
+        return
+    end
+    local groups = collect_zone_groups(parent)
+    if not groups then
+        return
+    end
+    local parent_uuid = parent.device_network_id
+    for _, group in ipairs(groups) do
+        local has_room = false
+        for _, m in ipairs(group.members) do
+            if m.uuid == room_uuid then
+                has_room = true
+            end
+        end
+        if has_room then
+            local grouped = (group.coordinator == parent_uuid)
+            emit(child, 'main', grouped and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+            return
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- Refresh
 -- ---------------------------------------------------------------------------
 

@@ -25,7 +25,7 @@ local sonos_driver = Driver("Sonos Extras", {
             ["setLevel"] = command_handlers.set_level
         },
         [capabilities.momentary.ID] = {
-            [capabilities.momentary.commands.push.NAME] = command_handlers.reset_eq
+            [capabilities.momentary.commands.push.NAME] = command_handlers.push
         },
         [capabilities.audioVolume.ID] = {
             [capabilities.audioVolume.commands.setVolume.NAME] = command_handlers.set_volume,

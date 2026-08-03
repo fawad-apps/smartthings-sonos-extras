@@ -46,6 +46,11 @@ components:
     capabilities:
       - id: momentary
         version: 1
+  - id: SyncRooms
+    label: Sync Sonos Rooms
+    capabilities:
+      - id: momentary
+        version: 1
   - id: Bass
     label: Bass
     capabilities:
