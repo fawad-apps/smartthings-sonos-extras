@@ -18,7 +18,7 @@ function command_handlers.switch_on(driver, device, command)
     if is_room_child(device) then
         upnp_services.join_room(driver, device)
     elseif command.component == 'PartyMode' then
-        upnp_services.group_all(device)
+        upnp_services.group_all(device, driver)
     elseif command.component == 'TVMode' then
         upnp_services.play_tv(device)
     else
@@ -30,7 +30,7 @@ function command_handlers.switch_off(driver, device, command)
     if is_room_child(device) then
         upnp_services.leave_room(driver, device)
     elseif command.component == 'PartyMode' then
-        upnp_services.ungroup_all(device)
+        upnp_services.ungroup_all(device, driver)
     elseif command.component == 'TVMode' then
         upnp_services.leave_tv(device)
     else

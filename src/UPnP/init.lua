@@ -371,7 +371,15 @@ local function discover (target, waitsecs, callback)
     
   end
   log.info (string.format("[upnp] Discovery response window ended for %s, %d new devices found", target, number_found))
-  
+
+  -- ids_found only exists to drop duplicate responses *within* one search
+  -- window, but it used to outlive the window: any scan that discovered a
+  -- player it then discarded (the "already known" branch in discovery.lua)
+  -- left the USN flagged, so every later discover() ignored that player for
+  -- the life of the driver process. A device still waiting to be reacquired
+  -- could then never be found again - and running "Scan for nearby devices",
+  -- the obvious thing to try when a tile says offline, is what triggered it.
+  ids_found = {}
   devdesc_fetched = {}
   s:close()
   return true
@@ -383,8 +391,12 @@ end
 local function reset(driver)
 
   watcher.shutdown(driver)
-  
-  eventing.shutdownsever(driver)
+
+  -- 'shutdownsever' - the module exports shutdownserver, so this raised
+  -- "attempt to call a nil value" and took the rest of the hub-IP-change
+  -- handler down with it, including the resubscribe that the whole path exists
+  -- to perform.
+  eventing.shutdownserver(driver)
 
 end
 

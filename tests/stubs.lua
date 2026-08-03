@@ -63,7 +63,14 @@ end
 function upnp.reset() end
 
 -- cosock / sockets ----------------------------------------------------------
-local socket = { sleep = function() end, gettime = function() return 0 end }
+-- The clock advances only when a test says so. Freezing it at 0 meant every
+-- TTL and cooldown in the driver (topology cache, favorites cache, reacquire
+-- backoff) was untestable, because no elapsed time could ever be expressed.
+local clock = { now = 0 }
+local socket = {
+    sleep = function() end,
+    gettime = function() return clock.now end
+}
 
 -- Records every request so tests can assert on what the driver actually put on
 -- the wire. `http.handler` lets a test answer with a canned body: the stubbed
@@ -140,5 +147,11 @@ stubs.log = log
 stubs.upnp = upnp
 stubs.capabilities = capabilities
 stubs.http = http
+
+-- Move the stubbed clock forward, so a test can express "and then 20 seconds
+-- passed" and see a cache actually expire.
+function stubs.advance(seconds)
+    clock.now = clock.now + seconds
+end
 
 return stubs

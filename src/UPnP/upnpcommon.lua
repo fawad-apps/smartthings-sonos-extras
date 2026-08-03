@@ -42,7 +42,16 @@ local function process_response(resp, types)
   local info = {}
   local prefix = string.match(resp, "^([%g ]*)\r\n", 1)
   local match = false
-  
+
+  -- Anything on the SSDP multicast group lands here, including datagrams that
+  -- are not CRLF-framed, and the pattern then yields nil. Indexing that nil
+  -- aborted the whole multicast handler - visible on the hub as a stream of
+  -- "bad argument #1 to 'find' (string expected, got nil)" warnings, each one
+  -- a batch of SSDP responses dropped on the floor.
+  if not prefix then
+    return nil
+  end
+
   for _, resptype in ipairs(types) do
 		if string.find(prefix, resptype, nil, "plaintext") ~= nil then
 			match = true

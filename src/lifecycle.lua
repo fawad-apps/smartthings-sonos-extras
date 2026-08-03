@@ -147,6 +147,17 @@ local function startup(driver, device, upnpdev)
     device:online()
     upnp_services.emit_static_capabilities(device)
     upnp_services.refresh_components(device)
+
+    -- Create the per-room toggles without anyone having to find and press the
+    -- Sync Sonos Rooms button first. Deferred so it lands behind the refresh
+    -- rather than adding another topology fetch to startup, and guarded so a
+    -- failure here cannot take the rest of startup with it.
+    device.thread:call_with_delay(15, function()
+        local ok, err = pcall(upnp_services.sync_rooms, driver, device)
+        if not ok then
+            log.warn("Automatic room sync failed: " .. tostring(err))
+        end
+    end)
 end
 
 -- Let upnp_services fully re-initialise a device it reacquires on demand.
@@ -214,6 +225,8 @@ function lifecycle.device_removed(driver, device)
         -- stop monitoring & allow for later re-discovery
         upnpdev:forget()
     end
+
+    upnp_services.invalidate_topology(device)
 end
 
 function lifecycle.device_init(driver, device)
@@ -268,12 +281,34 @@ function lifecycle.resubscribe_all(driver)
 end
 
 function lifecycle.lan_info_changed_handler(driver, hub_ipv4)
-    if driver.listen_ip == nil or hub_ipv4 ~= driver.listen_ip then
-        -- reset device monitoring and subscription event server
-        upnp.reset(driver)
-        -- renew all subscriptions
-        lifecycle.resubscribe_all(driver)
+    if driver.listen_ip ~= nil and hub_ipv4 == driver.listen_ip then
+        return
     end
+    -- Remember it, or the guard is true on every call because nothing else
+    -- ever set this, and a reset ran each time the platform mentioned the IP.
+    driver.listen_ip = hub_ipv4
+    log.info("Hub IP is now " .. tostring(hub_ipv4) .. "; resetting UPnP and resubscribing")
+
+    -- Reset device monitoring and the subscription event server. Guarded: this
+    -- path is only reached when something already went wrong with the network,
+    -- and a failure here used to take the resubscribe below down with it -
+    -- leaving every subscription pointed at an address that no longer exists.
+    local ok, err = pcall(upnp.reset, driver)
+    if not ok then
+        log.error("UPnP reset failed: " .. tostring(err))
+    end
+
+    -- upnp.reset empties the monitor's watch table, and only startup ever adds
+    -- to it, so online/offline detection would stay dead for the life of the
+    -- driver unless every device re-registers here.
+    for _, device in ipairs(driver:get_devices()) do
+        local upnpdev = device:get_field("upnpdevice")
+        if upnpdev then
+            pcall(function() upnpdev:monitor(status_changed_callback) end)
+        end
+    end
+
+    lifecycle.resubscribe_all(driver)
 end
 
 return lifecycle

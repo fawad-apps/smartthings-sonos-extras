@@ -303,10 +303,13 @@ end
 
 local function shutdown(driver)
 
-  driver:unregister_channel_handler(m)
-  driver:unregister_channel_handler(u)
-	m:close()
-  u:close()
+  -- Reachable before any device has ever been monitored (a hub IP change with
+  -- no device linked yet), in which case the sockets do not exist.
+  for _, sock in ipairs({ m, u }) do
+    driver:unregister_channel_handler(sock)
+    sock:close()
+  end
+  m, u = nil, nil
 	initflag = false
   watchtable = {}
   

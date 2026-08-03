@@ -246,4 +246,55 @@ t.test("group_state returns nil for a player not in the topology", function()
     t.falsy(upnp_services.group_state(real_groups(), "RINCON_000000000000000"), "unknown player")
 end)
 
+-- ---------------------------------------------------------------------------
+-- SSDP framing: anything at all can arrive on the multicast group
+-- ---------------------------------------------------------------------------
+
+local upnpcommon = require("UPnP.upnpcommon")
+
+t.test("a datagram that isn't CRLF-framed is ignored, not fatal", function()
+    -- The hub logged a steady stream of "bad argument #1 to 'find' (string
+    -- expected, got nil)" from here. The status-line pattern returns nil for
+    -- such a datagram and indexing it killed the multicast handler, taking a
+    -- whole batch of real SSDP responses down with it.
+    t.falsy(upnpcommon.process_response("garbage with no crlf", { "200 OK" }), "ignored")
+    t.falsy(upnpcommon.process_response("", { "200 OK" }), "empty datagram ignored")
+end)
+
+t.test("a real SSDP response still parses", function()
+    local resp = "HTTP/1.1 200 OK\r\n" ..
+        "CACHE-CONTROL: max-age=1800\r\n" ..
+        "LOCATION: http://192.168.2.109:1400/xml/device_description.xml\r\n" ..
+        "USN: uuid:RINCON_74CA60D0A14C01400_MR::urn:schemas-upnp-org:device:MediaRenderer:1\r\n" ..
+        "\r\n"
+    local headers = upnpcommon.process_response(resp, { "200 OK" })
+    t.truthy(headers, "parsed")
+    t.eq(headers["location"], "http://192.168.2.109:1400/xml/device_description.xml", "location")
+    t.matches(headers["usn"], "^uuid:RINCON_", "usn")
+end)
+
+-- ---------------------------------------------------------------------------
+-- Dialog Level is backed by two EQ types at once
+-- ---------------------------------------------------------------------------
+
+t.test("Dialog Level settles on the newer flag when an event carries both", function()
+    -- Arc Ultra reports SpeechEnhanceEnabled (0/1) and the legacy DialogLevel
+    -- (an intensity) in the same event. Emitting for each meant two
+    -- contradictory switch events per event, in whatever order pairs() chose,
+    -- so the tile could settle on the value we trust least.
+    local device = stubs.device({ components = { "main", "DialogLevel" } })
+    upnp_services.rendering_event_callback(device, "sid", 1, {
+        LastChange = '<Event><InstanceID val="0">' ..
+            '<SpeechEnhanceEnabled val="0"/><DialogLevel val="4"/>' ..
+            '</InstanceID></Event>'
+    })
+
+    local dialog = {}
+    for _, e in ipairs(device.emitted) do
+        if e.component == "DialogLevel" then table.insert(dialog, e.event.value) end
+    end
+    t.eq(#dialog, 1, "one event for the switch, not two")
+    t.eq(dialog[1], "off", "SpeechEnhanceEnabled wins over the legacy value")
+end)
+
 t.run()

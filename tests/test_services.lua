@@ -196,6 +196,31 @@ t.test("topology is fetched once for every consumer in a refresh", function()
     t.eq(count_action("GetZoneGroupState"), 1, "one topology fetch for two consumers")
 end)
 
+t.test("the topology cache expires rather than serving a stale household forever", function()
+    -- The cache exists to collapse one refresh's three fetches into one, not
+    -- to pin the topology for the life of the driver.
+    local device = fake_player({ GetZoneGroupState = zone_group_response(STANDALONE) })
+    upnp_services.get_group_state(device)
+    stubs.advance(3)
+    upnp_services.get_group_state(device)
+    t.eq(count_action("GetZoneGroupState"), 1, "still cached a moment later")
+
+    stubs.advance(30)
+    upnp_services.get_group_state(device)
+    t.eq(count_action("GetZoneGroupState"), 2, "re-read once the cache is old")
+end)
+
+t.test("the favorites cache expires too", function()
+    local device = fake_player({ Browse = read_fixture("favorites_browse.xml") })
+    upnp_services.get_presets(device)
+    upnp_services.get_presets(device)
+    t.eq(count_action("Browse"), 1, "cached")
+
+    stubs.advance(1000)
+    upnp_services.get_presets(device)
+    t.eq(count_action("Browse"), 2, "re-browsed once the cache is old")
+end)
+
 t.test("invalidating the topology forces a fresh read", function()
     -- Anything that regroups speakers must not leave the old layout cached.
     local device = fake_player({ GetZoneGroupState = zone_group_response(STANDALONE) })
@@ -339,6 +364,19 @@ t.test("TV Mode follows a source change made outside SmartThings", function()
     upnp_services.avtransport_event_callback(device, "sid", 2,
         lastchange('<AVTransportURI val="x-rincon-queue:' .. ARC .. '#0"/>'))
     t.eq(emitted_for(device, "TVMode").value, "off", "switching to the queue turns it off")
+end)
+
+t.test("a failed poll leaves the now-playing tile alone", function()
+    -- Every command returns nil when the player is slow or unreachable, and
+    -- build_track_data would then produce {title="Unknown"} - wiping the
+    -- title, artist, album and cover art of music that is still playing.
+    local device = fake_player()
+    upnp_services.get_track_data(device)
+
+    for _, e in ipairs(device.emitted) do
+        t.falsy(e.event.attribute == "audioTrackData",
+            "no now-playing event emitted from a failed poll")
+    end
 end)
 
 t.test("an event with no URI leaves the TV switch alone", function()

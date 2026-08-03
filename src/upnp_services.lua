@@ -703,8 +703,9 @@ local function set_party_switch(device, on)
     emit(device, 'PartyMode', on and capabilities.switch.switch.on() or capabilities.switch.switch.off())
 end
 
--- Group every other (visible) Sonos player under this soundbar.
-function upnp_services.group_all(device)
+-- Group every other (visible) Sonos player under this soundbar. `driver` is
+-- optional and only used to bring the per-room toggles in line afterwards.
+function upnp_services.group_all(device, driver)
     local self_uuid = upnp_services.player_uuid(device)
     local groups = collect_zone_groups(device)
     if not groups then
@@ -734,10 +735,13 @@ function upnp_services.group_all(device)
     end
     upnp_services.invalidate_topology(device)
     set_party_switch(device, count > 0)
+    if driver then
+        upnp_services.refresh_room_children(driver, device)
+    end
 end
 
 -- Split every other player currently grouped with this soundbar into standalone.
-function upnp_services.ungroup_all(device)
+function upnp_services.ungroup_all(device, driver)
     local self_uuid = upnp_services.player_uuid(device)
     local groups = collect_zone_groups(device)
     if not groups then
@@ -759,6 +763,9 @@ function upnp_services.ungroup_all(device)
     log.info(string.format("Party mode OFF: ungrouped %d of %d player(s)", count, #targets))
     upnp_services.invalidate_topology(device)
     set_party_switch(device, false)
+    if driver then
+        upnp_services.refresh_room_children(driver, device)
+    end
 end
 
 -- Reflect current grouping state on the Party Mode switch. Callers that already
@@ -830,6 +837,9 @@ function upnp_services.play_tv(device)
         { InstanceID = 0, CurrentURI = upnp_services.tv_uri(uuid), CurrentURIMetaData = '' })
     if not ok then
         log.error("TV mode: could not switch to the TV input")
+        -- The app has already drawn the switch as on. Put back what the
+        -- soundbar is really playing, or it sits there claiming TV audio.
+        upnp_services.get_track_data(device)
         return
     end
 
@@ -851,6 +861,17 @@ local function find_device(driver, device_id)
         end
     end
     return nil
+end
+
+-- Re-read the grouping state of every room child, so the per-room toggles and
+-- the Party Mode switch cannot disagree about the same group.
+function upnp_services.refresh_room_children(driver, parent)
+    for _, d in ipairs(driver:get_devices()) do
+        if d.device_network_id and d.device_network_id:find(":group:", 1, true)
+            and d.parent_device_id == parent.id then
+            upnp_services.refresh_room(driver, d)
+        end
+    end
 end
 
 -- Create a child toggle device for every other visible Sonos room.
@@ -890,8 +911,31 @@ function upnp_services.sync_rooms(driver, device)
             end
         end
     end
+    -- A room that has gone (renamed, sold, unplugged for good) leaves a toggle
+    -- behind that can only ever fail, so say so. Deleting someone's device
+    -- automatically is not ours to decide, and a speaker that is merely off
+    -- would come back.
+    local live = {}
+    for _, m in ipairs(rooms) do
+        live[m.uuid] = true
+    end
+    local stale = {}
+    for _, d in ipairs(driver:get_devices()) do
+        local room = d.device_network_id and d.device_network_id:match(":group:(.+)")
+        if room and not live[room] then
+            table.insert(stale, d.label or room)
+        end
+    end
+    if #stale > 0 then
+        log.warn(string.format(
+            "Sync rooms: %d toggle(s) no longer match a visible Sonos room and will not work " ..
+            "until that room is back - remove them in the app if they are gone for good: %s",
+            #stale, table.concat(stale, ", ")))
+    end
+
     log.info(string.format("Sync rooms: %d room(s) visible, created %d new toggle(s)",
         #rooms, created))
+    upnp_services.refresh_room_children(driver, device)
 end
 
 -- Resolve a child toggle -> (parent uuid, room ip, room port) from live topology.
@@ -928,6 +972,10 @@ function upnp_services.join_room(driver, child)
         upnp_services.invalidate_topology(parent)
     end
     emit(child, 'main', ok and capabilities.switch.switch.on() or capabilities.switch.switch.off())
+    -- Joining a room changes the soundbar's group, so Party Mode has to agree.
+    if parent then
+        upnp_services.get_group_state(parent)
+    end
 end
 
 function upnp_services.leave_room(driver, child)
@@ -941,6 +989,9 @@ function upnp_services.leave_room(driver, child)
         upnp_services.invalidate_topology(parent)
     end
     emit(child, 'main', capabilities.switch.switch.off())
+    if parent then
+        upnp_services.get_group_state(parent)
+    end
 end
 
 -- Reflect whether a room is currently grouped with the soundbar.
@@ -986,7 +1037,9 @@ end
 local NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
 
 local function usable(value)
-    if value == nil or value == '' or value == NOT_IMPLEMENTED then
+    -- Sonos also reports "nothing here" as a single space (dc:title on the TV
+    -- input), which is not worth putting on a tile.
+    if value == nil or value == NOT_IMPLEMENTED or value:match("^%s*$") then
         return nil
     end
     return value
@@ -1086,8 +1139,20 @@ function upnp_services.get_track_data(device)
     local track_didl = pos and pos.GetPositionInfo and pos.GetPositionInfo.TrackMetaData
     local current_uri = media and media.GetMediaInfo and media.GetMediaInfo.CurrentURI
     local current_didl = media and media.GetMediaInfo and media.GetMediaInfo.CurrentURIMetaData
-    emit_track_data(device, track_didl, current_uri, current_didl)
+
     upnp_services.sync_tv_state(device, current_uri)
+
+    -- Hold the tile rather than blank it. Both commands return nil when the
+    -- player is slow or unreachable, and build_track_data would then produce
+    -- {title = "Unknown"} - wiping the title, artist, album and cover art of
+    -- music that is still playing. This is the same rule the event path uses;
+    -- it was missing here, which quietly undid half of that fix.
+    if not (usable(track_didl) or usable(current_uri)) then
+        log.debug("No usable now-playing data in this poll; leaving the tile as it is")
+        return
+    end
+
+    emit_track_data(device, track_didl, current_uri, current_didl)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1504,11 +1569,18 @@ function upnp_services.rendering_event_callback(device, sid, sequence, propertyl
         return
     end
 
-    -- EQ switches
-    for eqType, comp in pairs(eqtype_to_switch) do
-        local value = lc_value(inst, eqType)
-        if value then
-            emit(device, comp, switch_event_for_value(value))
+    -- EQ switches. Take each component's eqTypes in their configured order and
+    -- emit only the first one present: Dialog Level is backed by both
+    -- SpeechEnhanceEnabled and the legacy DialogLevel, and an event carrying
+    -- both used to emit twice, in whatever order pairs() felt like, so the
+    -- switch could settle on the value we trust least.
+    for comp, cfg in pairs(switch_eqs) do
+        for _, eqType in ipairs(cfg.eqTypes) do
+            local value = lc_value(inst, eqType)
+            if value then
+                emit(device, comp, switch_event_for_value(value))
+                break
+            end
         end
     end
 
