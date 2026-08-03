@@ -23,6 +23,11 @@ components:
         version: 1
     categories:
       - name: MediaPlayer
+  - id: TVMode
+    label: TV Mode
+    capabilities:
+      - id: momentary
+        version: 1
   - id: DialogLevel
     label: Dialog Level
     capabilities:

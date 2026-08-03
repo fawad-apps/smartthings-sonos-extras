@@ -4,6 +4,12 @@ local upnp = require "UPnP"
 local cosock = require "cosock"
 local socket = require "cosock.socket"
 local http = cosock.asyncify "socket.http"
+-- LuaSocket defaults to 60s, so a Sonos that is asleep, rebooting or simply
+-- gone wedges the device thread for a full minute per request - which the user
+-- sees as the whole driver hanging. It can't go much lower than this though:
+-- queuing a music-service playlist really does take Sonos ~10s to answer while
+-- it talks to the service.
+http.TIMEOUT = 15
 local ltn12 = require "ltn12"
 -- No XML parser here on purpose: Sonos payloads embed escaped XML inside
 -- attribute values, which a tree parser chokes on. Everything is read with
@@ -32,6 +38,11 @@ local CD_SERVICE_TYPE = "urn:schemas-upnp-org:service:ContentDirectory:1"
 local CD_CONTROL_PATH = "/MediaServer/ContentDirectory/Control"
 local GRC_SERVICE_TYPE = "urn:schemas-upnp-org:service:GroupRenderingControl:1"
 local GRC_CONTROL_PATH = "/MediaRenderer/GroupRenderingControl/Control"
+local ZGT_SERVICE_TYPE = "urn:schemas-upnp-org:service:ZoneGroupTopology:1"
+local ZGT_CONTROL_PATH = "/ZoneGroupTopology/Control"
+
+-- The soundbar's TV input. Every Sonos soundbar exposes it under this scheme.
+local TV_STREAM_SUFFIX = ":spdif"
 
 -- Sonos favorites container.
 local FAVORITES_OBJECT_ID = "FV:2"
@@ -164,13 +175,23 @@ end
 -- (monitoring + event subscriptions) without this module depending on lifecycle.
 upnp_services.reinit_hook = nil
 
+local function now()
+    return socket.gettime()
+end
+
 local reacquiring = false
+
+-- Rediscovery blocks the device thread for several seconds. Once it has failed,
+-- retrying it on every single command turns one unreachable player into a
+-- driver that appears to hang on every tap, so back off and fail fast instead.
+local REACQUIRE_COOLDOWN = 60
+local reacquire_blocked_until = 0
 
 -- If discovery failed at startup the device has no UPnP handle and every
 -- command dies. Rather than stay broken until the driver restarts, try to find
 -- the player again on demand.
 function upnp_services.reacquire(device)
-    if reacquiring then
+    if reacquiring or now() < reacquire_blocked_until then
         return nil
     end
     reacquiring = true
@@ -187,6 +208,7 @@ function upnp_services.reacquire(device)
         -- an offline marker is the only signal the user ever sees.
         log.error("Could not reach player for <" .. tostring(device.device_network_id) .. ">")
         device:offline()
+        reacquire_blocked_until = now() + REACQUIRE_COOLDOWN
     end
     reacquiring = false
     return device:get_field("upnpdevice")
@@ -239,6 +261,16 @@ local function xml_unescape(s)
     end))
 end
 
+-- The UPnP error codes Sonos actually returns, so a failure in the log says
+-- what to do about it rather than just "500".
+local SOAP_ERRORS = {
+    ["402"] = "invalid arguments",
+    ["701"] = "transition not available",
+    ["714"] = "unsupported URI",
+    ["800"] = "music service refused it - the account may need re-linking in the Sonos app",
+    ["804"] = "music service not authenticated"
+}
+
 -- Send a raw SOAP action to an explicit ip:port. Used both to command *other*
 -- Sonos players (for grouping) and to reach services that don't live on the
 -- MediaRenderer sub-device we discovered (ContentDirectory, GroupRenderingControl).
@@ -268,11 +300,18 @@ local function soap_post(ip, port, path, service_type, action, args)
             ["CONTENT-LENGTH"] = #body
         }
     }
+    local response = table.concat(resp_chunks)
     if code ~= 200 then
-        log.error(string.format("SOAP %s to %s failed: %s", action, tostring(ip), tostring(code)))
-        return false
+        -- The HTTP code is always 500 for a UPnP fault; the code that says what
+        -- actually went wrong is buried in the fault body, and without it every
+        -- failure looked identical in the log.
+        local fault = response:match("<errorCode>(%d+)</errorCode>")
+        log.error(string.format("SOAP %s to %s failed: HTTP %s%s", action, tostring(ip),
+            tostring(code), fault and (", UPnP error " .. fault ..
+                (SOAP_ERRORS[fault] and (" (" .. SOAP_ERRORS[fault] .. ")") or "")) or ""))
+        return false, response
     end
-    return true, table.concat(resp_chunks)
+    return true, response
 end
 
 -- Sonos exposes every service on the player's own ip:1400, so anything the
@@ -585,9 +624,29 @@ function upnp_services.group_state(groups, self_uuid)
     return nil
 end
 
+-- ZoneGroupState is the largest payload Sonos returns - the whole household,
+-- satellites included - and a single refresh needs it three times over (party
+-- switch, mediaGroup, room children). Fetching it once per burst is the
+-- difference between one round trip and three.
+local TOPOLOGY_TTL = 10
+local topology_cache = {}
+
+function upnp_services.invalidate_topology(device)
+    topology_cache[device.id] = nil
+end
+
 local function collect_zone_groups(device)
-    local response = command(device, upnp_services.zonetopology_service_id, 'GetZoneGroupState', {})
-    local xml = response and response.GetZoneGroupState and response.GetZoneGroupState.ZoneGroupState
+    local cached = topology_cache[device.id]
+    if cached and (now() - cached.at) < TOPOLOGY_TTL then
+        return cached.groups
+    end
+
+    -- Read this one with raw SOAP rather than through the UPnP library: the
+    -- response carries the topology as escaped XML inside the SOAP body, and
+    -- running tens of KB of that through the tree parser costs the hub far more
+    -- than the request itself. Patterns read it straight.
+    local ok, body = self_soap(device, ZGT_CONTROL_PATH, ZGT_SERVICE_TYPE, 'GetZoneGroupState', {})
+    local xml = ok and body and xml_unescape(body:match("<ZoneGroupState>(.-)</ZoneGroupState>"))
     if not xml then
         log.error("Could not read ZoneGroupState")
         return nil
@@ -596,7 +655,10 @@ local function collect_zone_groups(device)
     local groups = upnp_services.parse_zone_groups(xml)
     if not groups then
         log.error("ZoneGroupState contained no zone groups")
+        return nil
     end
+
+    topology_cache[device.id] = { at = now(), groups = groups }
     return groups
 end
 
@@ -633,6 +695,7 @@ function upnp_services.group_all(device)
     if failed > 0 then
         log.warn(string.format("Party mode: %d player(s) did not join", failed))
     end
+    upnp_services.invalidate_topology(device)
     set_party_switch(device, count > 0)
 end
 
@@ -657,17 +720,59 @@ function upnp_services.ungroup_all(device)
         end
     end
     log.info(string.format("Party mode OFF: ungrouped %d of %d player(s)", count, #targets))
+    upnp_services.invalidate_topology(device)
     set_party_switch(device, false)
 end
 
--- Reflect current grouping state on the Party Mode switch.
-function upnp_services.get_group_state(device)
-    local groups = collect_zone_groups(device)
+-- Reflect current grouping state on the Party Mode switch. Callers that already
+-- hold the topology pass it in so refresh doesn't fetch it again.
+function upnp_services.get_group_state(device, groups)
+    groups = groups or collect_zone_groups(device)
     if not groups then
         return
     end
     local state = upnp_services.group_state(groups, upnp_services.player_uuid(device))
     set_party_switch(device, state ~= nil and state.grouped)
+end
+
+-- ---------------------------------------------------------------------------
+-- TV mode (put the soundbar back on its TV input)
+-- ---------------------------------------------------------------------------
+
+-- The soundbar's TV input is a stream on the player itself, addressed by its
+-- own uuid - so this must be the bare uuid, never the "_MR" SSDP form.
+function upnp_services.tv_uri(uuid)
+    return "x-sonos-htastream:" .. uuid .. TV_STREAM_SUFFIX
+end
+
+-- Switch back to TV audio after music, a favorite or a group has taken the
+-- transport over.
+function upnp_services.play_tv(device)
+    local uuid = upnp_services.player_uuid(device)
+
+    -- While the soundbar is a guest in someone else's group its transport
+    -- belongs to that group's coordinator, so setting the TV stream on it does
+    -- nothing until it heads its own group again. Only split when we're the
+    -- guest: doing it as coordinator would throw everyone out of Party Mode.
+    local groups = collect_zone_groups(device)
+    local state = groups and upnp_services.group_state(groups, uuid)
+    if state and state.role == 'auxiliary' then
+        log.info("TV mode: leaving group to take back the transport")
+        av_command(device, 'BecomeCoordinatorOfStandaloneGroup', { InstanceID = 0 })
+        upnp_services.invalidate_topology(device)
+    end
+
+    local ok = self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+        { InstanceID = 0, CurrentURI = upnp_services.tv_uri(uuid), CurrentURIMetaData = '' })
+    if not ok then
+        log.error("TV mode: could not switch to the TV input")
+        return
+    end
+
+    upnp_services.transport_play(device)
+    upnp_services.get_track_data(device)
+    upnp_services.get_transport_state(device)
+    log.info("TV mode: switched to TV audio")
 end
 
 -- ---------------------------------------------------------------------------
@@ -746,6 +851,7 @@ local function room_target(driver, child)
 end
 
 function upnp_services.join_room(driver, child)
+    local parent = find_device(driver, child.parent_device_id)
     local parent_uuid, ip, port = room_target(driver, child)
     if not ip then
         log.error("join_room: room not found in topology")
@@ -753,14 +859,21 @@ function upnp_services.join_room(driver, child)
     end
     local ok = soap_post(ip, port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
         { InstanceID = 0, CurrentURI = "x-rincon:" .. parent_uuid, CurrentURIMetaData = "" })
+    if parent then
+        upnp_services.invalidate_topology(parent)
+    end
     emit(child, 'main', ok and capabilities.switch.switch.on() or capabilities.switch.switch.off())
 end
 
 function upnp_services.leave_room(driver, child)
+    local parent = find_device(driver, child.parent_device_id)
     local _, ip, port = room_target(driver, child)
     if ip then
         soap_post(ip, port, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'BecomeCoordinatorOfStandaloneGroup',
             { InstanceID = 0 })
+    end
+    if parent then
+        upnp_services.invalidate_topology(parent)
     end
     emit(child, 'main', capabilities.switch.switch.off())
 end
@@ -913,26 +1026,35 @@ end
 -- Play a favorite. Container-style favorites (a playlist, album or station
 -- from a music service) have to be queued and played from the queue; a plain
 -- track or stream URI can be set on the transport directly.
+-- Returns false as soon as a step fails, so the caller can say the favorite
+-- didn't play instead of firing Play at a transport that was never loaded.
 local function play_uri(device, uri, meta)
+    local ok
     if uri:match("^x%-rincon%-cpcontainer:") or uri:match("^x%-rincon%-playlist:")
         or uri:match("^x%-rincon%-cpcontainer") or uri:match("^file:") then
         local queue_uri = "x-rincon-queue:" .. upnp_services.player_uuid(device) .. "#0"
         self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'RemoveAllTracksFromQueue',
             { InstanceID = 0 })
-        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'AddURIToQueue', {
+        ok = self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'AddURIToQueue', {
             InstanceID = 0,
             EnqueuedURI = uri,
             EnqueuedURIMetaData = meta or '',
             DesiredFirstTrackNumberEnqueued = 0,
             EnqueueAsNext = 1
         })
-        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+        if not ok then
+            return false
+        end
+        ok = self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
             { InstanceID = 0, CurrentURI = queue_uri, CurrentURIMetaData = '' })
     else
-        self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
+        ok = self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'SetAVTransportURI',
             { InstanceID = 0, CurrentURI = uri, CurrentURIMetaData = meta or '' })
     end
-    self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'Play', { InstanceID = 0, Speed = 1 })
+    if not ok then
+        return false
+    end
+    return self_soap(device, AV_CONTROL_PATH, AV_SERVICE_TYPE, 'Play', { InstanceID = 0, Speed = 1 })
 end
 
 -- Pure: a ContentDirectory Browse SOAP body in, (presets, meta_by_id) out.
@@ -967,7 +1089,7 @@ function upnp_services.parse_presets(body, art_base)
                 end
             end
 
-            local entry = { uri = uri, meta = meta }
+            local entry = { uri = uri, meta = meta, name = title }
             if entry.uri then
                 meta_by_id[id] = entry
                 table.insert(presets, {
@@ -983,7 +1105,17 @@ function upnp_services.parse_presets(body, art_base)
     return presets, meta_by_id
 end
 
-function upnp_services.get_presets(device)
+-- Favorites change rarely but the Browse response is one of the biggest things
+-- Sonos returns, so don't re-fetch it on every refresh.
+local PRESETS_TTL = 900
+
+function upnp_services.get_presets(device, force)
+    local fetched_at = device:get_field("presets_at")
+    if not force and fetched_at and device:get_field("presets")
+        and (now() - fetched_at) < PRESETS_TTL then
+        return
+    end
+
     local ok, body = self_soap(device, CD_CONTROL_PATH, CD_SERVICE_TYPE, 'Browse', {
         ObjectID = FAVORITES_OBJECT_ID,
         BrowseFlag = 'BrowseDirectChildren',
@@ -1004,6 +1136,7 @@ function upnp_services.get_presets(device)
     end
 
     device:set_field("presets", meta_by_id)
+    device:set_field("presets_at", now())
     emit(device, 'main', capabilities.mediaPresets.presets(presets))
     log.info(string.format("Loaded %d Sonos favorite(s)", #presets))
 end
@@ -1013,7 +1146,7 @@ function upnp_services.play_preset(device, preset_id)
     -- Favorites are only fetched on refresh, so a preset played before the
     -- first refresh (or after they changed) needs a fresh browse.
     if not (presets and presets[preset_id]) then
-        upnp_services.get_presets(device)
+        upnp_services.get_presets(device, true)
         presets = device:get_field("presets")
     end
 
@@ -1022,7 +1155,17 @@ function upnp_services.play_preset(device, preset_id)
         log.error("Unknown preset: " .. tostring(preset_id))
         return
     end
-    play_uri(device, entry.uri, entry.meta)
+
+    if play_uri(device, entry.uri, entry.meta) then
+        upnp_services.get_track_data(device)
+        upnp_services.get_transport_state(device)
+    else
+        -- The favorite itself is fine; Sonos declined to play it. The SOAP
+        -- error logged above says why - a music-service favorite needs that
+        -- service still linked to the household.
+        log.error(string.format("Sonos would not play favorite %s (%s)",
+            tostring(entry.name or preset_id), tostring(entry.uri)))
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1119,8 +1262,8 @@ local function grc_command(device, action, args)
     return self_soap(device, GRC_CONTROL_PATH, GRC_SERVICE_TYPE, action, args)
 end
 
-function upnp_services.get_media_group(device)
-    local groups = collect_zone_groups(device)
+function upnp_services.get_media_group(device, groups)
+    groups = groups or collect_zone_groups(device)
     if not groups then
         return
     end
@@ -1171,7 +1314,11 @@ end
 
 -- ---------------------------------------------------------------------------
 
-function upnp_services.refresh_components(device)
+-- Small, single round trips for the controls the user is actually looking at.
+function upnp_services.refresh_fast(device)
+    upnp_services.get_volume(device)
+    upnp_services.get_mute(device)
+    upnp_services.get_transport_state(device)
     for comp in pairs(switch_eqs) do
         upnp_services.get_switch_eq(device, comp)
     end
@@ -1181,13 +1328,29 @@ function upnp_services.refresh_components(device)
     for comp in pairs(level_controls) do
         get_level_control(device, comp)
     end
-    upnp_services.get_volume(device)
-    upnp_services.get_mute(device)
-    upnp_services.get_transport_state(device)
-    upnp_services.get_group_state(device)
+end
+
+-- Household topology, now-playing and favorites: the heavy half, several round
+-- trips including the two biggest payloads Sonos returns.
+function upnp_services.refresh_slow(device)
+    local groups = collect_zone_groups(device)
+    if groups then
+        upnp_services.get_group_state(device, groups)
+        upnp_services.get_media_group(device, groups)
+    end
     upnp_services.get_track_data(device)
-    upnp_services.get_media_group(device)
     upnp_services.get_presets(device)
+end
+
+-- A refresh is ~20 sequential requests, and everything the user does runs on
+-- this same thread - so a tap landing during one used to sit behind all of it.
+-- Answer with the cheap half immediately and let the rest run afterwards, where
+-- a queued command can get in front of it.
+function upnp_services.refresh_components(device)
+    upnp_services.refresh_fast(device)
+    device.thread:call_with_delay(1, function()
+        upnp_services.refresh_slow(device)
+    end)
 end
 
 -- ---------------------------------------------------------------------------

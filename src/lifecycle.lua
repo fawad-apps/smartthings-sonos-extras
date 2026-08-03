@@ -4,7 +4,16 @@ local upnp_services = require "upnp_services"
 local lifecycle = {}
 local upnp = require "UPnP"
 
-lifecycle.SUBSCRIBETIME = 86400
+-- Sonos drops event subscriptions silently - on a reboot, a software update, or
+-- any spell where it can't reach the hub's callback - and nothing tells us.
+-- Asking for a day-long subscription meant that when one died, every tile
+-- stayed frozen until the next manual refresh. Ask for an hour and renew at
+-- half that, so a lost subscription costs half an hour of staleness at worst
+-- instead of a day, for two requests every 30 minutes.
+lifecycle.SUBSCRIBETIME = 3600
+
+-- Safety net for the per-device renewal timers below.
+lifecycle.RESUBSCRIBE_INTERVAL = 3600
 
 -- Room-group children are created with a "<parent uuid>:group:<room uuid>" DNI.
 -- Do NOT test parent_device_id: the platform sets that to the hub for every LAN
@@ -27,22 +36,47 @@ local function ensure_profile(device)
     device:try_update_metadata({ profile = "sonos-extras" })
 end
 
+-- Sonos answers with the lifetime it actually granted ("Second-3600"), which
+-- can be shorter than what we asked for. Renewing off our own number instead
+-- would let the subscription lapse and take the live tile updates with it.
+local function granted_seconds(response)
+    local secs = response and response.timeout
+        and tostring(response.timeout):match("Second%-(%d+)")
+    return tonumber(secs) or lifecycle.SUBSCRIBETIME
+end
+
+local schedule_renewal -- defined below; mutually recursive with subscribe_device
+
 local function subscribe_device(device)
     local upnpdev = device:get_field('upnpdevice')
     if not upnpdev then
         return
     end
 
+    -- Any renewal timer from an earlier call is now stale. Both the driver-wide
+    -- timer and the per-device one land here, so without this they would fork
+    -- into competing renewal chains that resubscribe forever.
+    local generation = (device:get_field("sub_gen") or 0) + 1
+    device:set_field("sub_gen", generation)
+
+    local lifetime = lifecycle.SUBSCRIBETIME
+
     local rc = upnpdev:subscribe(upnp_services.rendering_service_id,
         upnp_services.rendering_event_callback, lifecycle.SUBSCRIBETIME, nil)
     if rc ~= nil then
         device:set_field("upnp_sid", rc.sid)
+        lifetime = math.min(lifetime, granted_seconds(rc))
     end
 
     local av = upnpdev:subscribe(upnp_services.avtransport_service_id,
         upnp_services.avtransport_event_callback, lifecycle.SUBSCRIBETIME, nil)
     if av ~= nil then
         device:set_field("upnp_sid_av", av.sid)
+        lifetime = math.min(lifetime, granted_seconds(av))
+    end
+
+    if rc or av then
+        schedule_renewal(device, generation, math.max(300, math.floor(lifetime / 2)))
     end
 
     return rc
@@ -61,16 +95,42 @@ local function cancel_subscriptions(device, upnpdev, unsubscribe)
     end
 end
 
+schedule_renewal = function(device, generation, seconds)
+    device.thread:call_with_delay(seconds, function()
+        if device:get_field("sub_gen") ~= generation then
+            return -- a later subscribe already took over
+        end
+        local upnpdev = device:get_field("upnpdevice")
+        if not upnpdev then
+            return
+        end
+        if not upnpdev.online then
+            -- Coming back online resubscribes; renewing at an unreachable
+            -- player would just block on timeouts.
+            schedule_renewal(device, generation, seconds)
+            return
+        end
+        cancel_subscriptions(device, upnpdev, true)
+        subscribe_device(device)
+    end)
+end
+
 local function status_changed_callback(device)
     local upnpdev = device:get_field("upnpdevice")
-    local sid = device:get_field("upnp_sid")
 
     if upnpdev.online then
         log.info("Device is back online")
         device:online()
-        if sid then
-            subscribe_device(device)
-        end
+        -- Always resubscribe. Going offline cleared upnp_sid, so the old
+        -- "only if we had a subscription" test could never be true here: a
+        -- device that blipped offline came back with no event subscriptions at
+        -- all and every tile stayed frozen until the driver was reinstalled.
+        subscribe_device(device)
+        -- State may well have moved while it was away; catch the tiles up off
+        -- the monitor thread.
+        device.thread:call_with_delay(1, function()
+            upnp_services.refresh_components(device)
+        end)
     else
         log.info("Device has gone offline")
         device:offline()
@@ -188,10 +248,11 @@ function lifecycle.resubscribe_all(driver)
     local device_list = driver:get_devices()
 
     for _, device in ipairs(device_list) do
-        -- Determine if there is a subscription for this device
-        local sid = device:get_field("upnp_sid")
-        if sid then
-            local upnpdev = device:get_field("upnpdevice")
+        -- Don't gate on an existing sid: a device whose subscriptions were
+        -- dropped is exactly the one that needs resubscribing, and it has no
+        -- sid left to test.
+        local upnpdev = device:get_field("upnpdevice")
+        if upnpdev then
             local name = upnpdev:devinfo().friendlyName
 
             -- Resubscribe only if the device is online

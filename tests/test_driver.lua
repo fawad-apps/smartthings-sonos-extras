@@ -135,6 +135,22 @@ t.test("switch on the soundbar sets EQ, does not join a room", function()
     t.eq(spy.calls[1], "set_switch_eq", "NightMode routes to EQ")
 end)
 
+t.test("the momentary buttons route to their own actions", function()
+    -- All three are the same capability on different components, so a missed
+    -- branch silently flattens the EQ instead of doing what the button says.
+    local handlers, spy = command_handlers_with_spy()
+    local soundbar = stubs.device({ dni = ARC_SSDP_UUID, parent_device_id = HUB_DEVICE_ID })
+
+    handlers.push(nil, soundbar, { component = "TVMode" })
+    t.eq(spy.calls[1], "play_tv", "TV Mode switches the input")
+
+    handlers.push(nil, soundbar, { component = "SyncRooms" })
+    t.eq(spy.calls[2], "sync_rooms", "Sync Rooms creates children")
+
+    handlers.push(nil, soundbar, { component = "ResetEQ" })
+    t.eq(spy.calls[3], "reset_eq", "Reset EQ flattens")
+end)
+
 t.test("switch on a room child joins the room", function()
     local handlers, spy = command_handlers_with_spy()
     local child = stubs.device({ dni = ARC_PLAYER_UUID .. ":group:RINCON_949F3E8CE16601400" })

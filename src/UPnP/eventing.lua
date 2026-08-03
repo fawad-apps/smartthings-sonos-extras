@@ -333,8 +333,12 @@ local function subscribe(devobj, serviceid, callback, subscribetime, statevars)
 
 	local sid = headers["sid"]
 	
-	if sid ~= nil then																										
-		subscriptions[sid] = {["stdevice"] = devobj.stdevice, ["callback"] = callback}
+	if sid ~= nil then
+		-- Remember where this subscription lives: UNSUBSCRIBE has to go back to
+		-- the same event URL, and it used to be hardcoded to a path no Sonos
+		-- serves, so cancelled subscriptions stayed alive on the player and kept
+		-- delivering duplicate events until they expired on their own.
+		subscriptions[sid] = {["stdevice"] = devobj.stdevice, ["callback"] = callback, ["url"] = urltarget}
 	
 		local timeout = headers["timeout"]
 		local varlist = headers["accepted-statevar"]
@@ -392,8 +396,11 @@ local function unsubscribe(devobj, sid)
 	
 	local response_body = {}
 
+	local sub = subscriptions[sid]
+	local url = (sub and sub.url) or ("http://" .. ip .. ":" .. port .. "/upnp/event/basicevent1")
+
 	local resp, code_or_err, _, status_line = http.request {
-			url = "http://" .. ip .. ":" .. port .. "/upnp/event/basicevent1",
+			url = url,
 			method = "UNSUBSCRIBE",
 			sink = ltn12.sink.table(response_body),
 			headers = {

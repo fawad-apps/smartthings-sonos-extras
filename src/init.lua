@@ -75,7 +75,10 @@ local sonos_driver = Driver("Sonos Extras", {
     }
 })
 
-sonos_driver:call_on_schedule(lifecycle.SUBSCRIBETIME - 5, lifecycle.resubscribe_all, "Re-subscribe timer")
+-- Subscriptions renew themselves per device off the lifetime Sonos granted;
+-- this is only the backstop for a device whose renewal timer was lost.
+sonos_driver:call_on_schedule(lifecycle.RESUBSCRIBE_INTERVAL, lifecycle.resubscribe_all,
+    "Re-subscribe timer")
 
 log.info("=== Sonos Extras: starting driver run loop ===")
 sonos_driver:run()

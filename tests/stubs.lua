@@ -64,7 +64,22 @@ function upnp.reset() end
 
 -- cosock / sockets ----------------------------------------------------------
 local socket = { sleep = function() end, gettime = function() return 0 end }
-local http = { request = function() return nil, 599 end }
+
+-- Records every request so tests can assert on what the driver actually put on
+-- the wire. `http.handler` lets a test answer with a canned body: the stubbed
+-- ltn12 sink IS the chunk table, so a handler appends to req.sink.
+local http = { requests = {}, handler = nil }
+function http.request(req)
+    table.insert(http.requests, req)
+    if http.handler then
+        return http.handler(req)
+    end
+    return nil, 599
+end
+function http.reset()
+    http.requests = {}
+    http.handler = nil
+end
 local cosock = {
     socket = socket,
     asyncify = function() return http end
@@ -124,5 +139,6 @@ end
 stubs.log = log
 stubs.upnp = upnp
 stubs.capabilities = capabilities
+stubs.http = http
 
 return stubs

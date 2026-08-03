@@ -38,10 +38,13 @@ function command_handlers.set_level(driver, device, command)
     upnp_services.set_level(device, command.component, command.args.level)
 end
 
--- Momentary buttons: Sync Sonos Rooms creates per-room toggles; Reset EQ flattens.
+-- Momentary buttons: Sync Sonos Rooms creates per-room toggles, TV Mode puts
+-- the soundbar back on its TV input, Reset EQ flattens the sliders.
 function command_handlers.push(driver, device, command)
     if command.component == 'SyncRooms' then
         upnp_services.sync_rooms(driver, device)
+    elseif command.component == 'TVMode' then
+        upnp_services.play_tv(device)
     else
         upnp_services.reset_eq(device)
     end
