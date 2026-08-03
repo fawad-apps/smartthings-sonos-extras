@@ -3,18 +3,27 @@ local upnp_services = require "upnp_services"
 
 local command_handlers = {}
 
--- Switch EQ (Dialog / Night Mode / Surround Mode) --------------------------
+-- Switch handlers: Party Mode groups/ungroups speakers; everything else is
+-- a RenderingControl EQ toggle (Dialog / Night Mode / Surround Mode).
 function command_handlers.switch_on(driver, device, command)
-    upnp_services.set_switch_eq(device, command.component, true)
+    if command.component == 'PartyMode' then
+        upnp_services.group_all(device)
+    else
+        upnp_services.set_switch_eq(device, command.component, true)
+    end
 end
 
 function command_handlers.switch_off(driver, device, command)
-    upnp_services.set_switch_eq(device, command.component, false)
+    if command.component == 'PartyMode' then
+        upnp_services.ungroup_all(device)
+    else
+        upnp_services.set_switch_eq(device, command.component, false)
+    end
 end
 
--- Level EQ sliders (Sub / Height / Surround) -------------------------------
+-- Level sliders (Bass / Treble / Sub / Height / Surround) -------------------
 function command_handlers.set_level(driver, device, command)
-    upnp_services.set_level_eq(device, command.component, command.args.level)
+    upnp_services.set_level(device, command.component, command.args.level)
 end
 
 -- Volume -------------------------------------------------------------------

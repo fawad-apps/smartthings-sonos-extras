@@ -34,6 +34,27 @@ components:
         version: 1
     categories:
       - name: Switch
+  - id: PartyMode
+    label: Party Mode (group all)
+    capabilities:
+      - id: switch
+        version: 1
+    categories:
+      - name: Switch
+  - id: Bass
+    label: Bass
+    capabilities:
+      - id: switchLevel
+        version: 1
+    categories:
+      - name: Switch
+  - id: Treble
+    label: Treble
+    capabilities:
+      - id: switchLevel
+        version: 1
+    categories:
+      - name: Switch
   - id: SubGain
     label: Sub Level
     capabilities:
