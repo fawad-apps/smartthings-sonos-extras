@@ -24,8 +24,11 @@ This fork adds a full local control surface on top of the original EQ switches.
 
 | Component | What it does |
 |---|---|
-| Dialog Level, Night Mode, Surround Mode, Loudness | On/off sound settings |
-| Bass, Treble, Sub Level, Height/Atmos Level, Surround Level | Sliders showing the real Sonos value (e.g. `+3`), not a 0–100 % dimmer |
+| Dialog Level, Night Mode, Loudness | On/off sound settings |
+| Surrounds On | Whether the surround speakers play at all (`SurroundEnable`) |
+| Surround Music - Full | Ambient or Full surround for **music** played through the home theatre (`SurroundMode`). Despite the old name this was never an on/off for the surrounds — that is Surrounds On |
+| Bass, Treble, Sub Level, Height/Atmos Level | Sliders showing the real Sonos value (e.g. `+3`), not a 0–100 % dimmer |
+| Surround Level (TV), Surround Level (Music) | Two independent trims on the same surround speakers, one per source, each −15…+15 |
 | Reset EQ | Flattens every slider to 0 |
 | TV Mode | Selects the soundbar's TV input, leaving a group first if it is only a guest in one. A switch rather than a button, so it also *shows* whether the soundbar is on TV audio and can be used as a condition in a routine — and it tracks the source even when you change it from the Sonos app or the TV remote, since the transport URI is in the events the driver already receives |
 | Party Mode | Groups every other visible speaker under the soundbar; off splits them again |
