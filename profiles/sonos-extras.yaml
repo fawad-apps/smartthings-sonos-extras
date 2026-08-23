@@ -58,15 +58,27 @@ components:
         version: 1
     categories:
       - name: Switch
+  - id: SurroundEnable
+    label: Surrounds On
+    capabilities:
+      - id: switch
+        version: 1
+    categories:
+      - name: Switch
   - id: SurroundMode
-    label: Surround Mode
+    label: Surround Music - Full
     capabilities:
       - id: switch
         version: 1
     categories:
       - name: Switch
   - id: SurroundLevel
-    label: Surround Level
+    label: Surround Level (TV)
+    capabilities:
+      - id: autumnpepper05038.surroundlevel
+        version: 1
+  - id: MusicSurroundLevel
+    label: Surround Level (Music)
     capabilities:
       - id: autumnpepper05038.surroundlevel
         version: 1

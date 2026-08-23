@@ -99,9 +99,19 @@ upnp_services.id_matches = id_matches
 
 -- Switch-style EQ settings. DialogLevel prefers the newer SpeechEnhanceEnabled
 -- on/off flag (Arc Ultra and later), falling back to the legacy DialogLevel.
+--
+-- `eventNames` exists because Sonos does not always use one spelling in both
+-- directions: SetEQ/GetEQ take the EQType "SurroundEnable", but the
+-- RenderingControl LastChange event reports the same setting as
+-- "SurroundEnabled". Routing events by eqType alone leaves the switch frozen
+-- until the next poll. Defaults to eqTypes when the two agree.
+--
+-- SurroundMode is NOT "are the surrounds on" - it is Ambient(0) vs Full(1) for
+-- MUSIC played through the home theatre. SurroundEnable is the real on/off.
 local switch_eqs = {
     NightMode = { eqTypes = { "NightMode" } },
     SurroundMode = { eqTypes = { "SurroundMode" } },
+    SurroundEnable = { eqTypes = { "SurroundEnable" }, eventNames = { "SurroundEnabled" } },
     DialogLevel = { eqTypes = { "SpeechEnhanceEnabled", "DialogLevel" } }
 }
 
@@ -119,10 +129,15 @@ local EQ_CAP = "autumnpepper05038.eqlevel"
 local SURROUND_CAP = "autumnpepper05038.surroundlevel"
 
 -- Slider-style EQ settings via SetEQ/GetEQ, reported as their actual signed value.
+-- SurroundLevel and MusicSurroundLevel are two independent trims on the same
+-- speakers - TV audio and music respectively - so both have to be exposed or
+-- half the surround behaviour is unreachable. Both clamp to -15..15 (verified
+-- against an Arc Ultra: it accepts 16 and reports back 15).
 local level_eqs = {
     SubGain = { eqType = "SubGain", min = -10, max = 10, cap = EQ_CAP },
     HeightLevel = { eqType = "HeightChannelLevel", min = -10, max = 10, cap = EQ_CAP },
-    SurroundLevel = { eqType = "SurroundLevel", min = -15, max = 15, cap = SURROUND_CAP }
+    SurroundLevel = { eqType = "SurroundLevel", min = -15, max = 15, cap = SURROUND_CAP },
+    MusicSurroundLevel = { eqType = "MusicSurroundLevel", min = -15, max = 15, cap = SURROUND_CAP }
 }
 
 -- Slider-style settings via dedicated actions (Bass/Treble use Set/GetBass, not SetEQ).
@@ -1681,8 +1696,8 @@ function upnp_services.rendering_event_callback(device, sid, sequence, propertyl
     -- both used to emit twice, in whatever order pairs() felt like, so the
     -- switch could settle on the value we trust least.
     for comp, cfg in pairs(switch_eqs) do
-        for _, eqType in ipairs(cfg.eqTypes) do
-            local value = lc_value(inst, eqType)
+        for _, name in ipairs(cfg.eventNames or cfg.eqTypes) do
+            local value = lc_value(inst, name)
             if value then
                 emit(device, comp, switch_event_for_value(value))
                 break

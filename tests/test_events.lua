@@ -297,4 +297,46 @@ t.test("Dialog Level settles on the newer flag when an event carries both", func
     t.eq(dialog[1], "off", "SpeechEnhanceEnabled wins over the legacy value")
 end)
 
+-- ---------------------------------------------------------------------------
+-- Surround controls
+-- ---------------------------------------------------------------------------
+
+t.test("Surrounds On follows an event that spells it SurroundEnabled", function()
+    -- Sonos uses two spellings for one setting: SetEQ/GetEQ take the EQType
+    -- "SurroundEnable", but the event reports "SurroundEnabled". Looking the
+    -- event up by eqType finds nothing and the switch stays frozen until the
+    -- next poll - which is exactly the bug `eventNames` exists to prevent.
+    local device = stubs.device({ components = { "main", "SurroundEnable" } })
+    upnp_services.rendering_event_callback(device, "sid", 1, {
+        LastChange = '<Event><InstanceID val="0"><SurroundEnabled val="0"/></InstanceID></Event>'
+    })
+
+    local seen = {}
+    for _, e in ipairs(device.emitted) do
+        if e.component == "SurroundEnable" then table.insert(seen, e.event.value) end
+    end
+    t.eq(#seen, 1, "the switch was updated from the event")
+    t.eq(seen[1], "off", "SurroundEnabled=0 reads as off")
+end)
+
+t.test("TV and music surround levels are independent", function()
+    -- One event carries both trims. They address the same speakers but
+    -- different sources, so each has to land on its own slider - emitting one
+    -- value to both would make the two tiles impossible to tell apart.
+    local device = stubs.device({
+        components = { "main", "SurroundLevel", "MusicSurroundLevel" } })
+    upnp_services.rendering_event_callback(device, "sid", 1, {
+        LastChange = '<Event><InstanceID val="0">' ..
+            '<SurroundLevel val="-4"/><MusicSurroundLevel val="9"/>' ..
+            '</InstanceID></Event>'
+    })
+
+    local levels = {}
+    for _, e in ipairs(device.emitted) do
+        levels[e.component] = e.event.value
+    end
+    t.eq(levels.SurroundLevel, -4, "TV surround trim")
+    t.eq(levels.MusicSurroundLevel, 9, "music surround trim, not the TV one")
+end)
+
 t.run()
