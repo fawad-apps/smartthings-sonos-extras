@@ -9,7 +9,8 @@ local discovery = {}
 local profiles = {
     ["S9"] = "sonos-extras",  -- Playbar
     ["S14"] = "sonos-extras", -- Beam (Gen 1)
-    ["S19"] = "sonos-extras"  -- Arc
+    ["S19"] = "sonos-extras", -- Arc
+    ["S59"] = "sonos-extras"  -- Beam Ultra
 }
 
 -- Fallback so newer / unlisted Sonos soundbars (e.g. Arc Ultra, Beam Gen 2,
