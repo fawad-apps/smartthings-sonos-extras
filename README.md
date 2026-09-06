@@ -9,9 +9,10 @@ This device uses UPnP to discover the Sonos devices and subscribe to events to u
 
 ## Supported devices
 Sonos home-theater devices (soundbars) are supported. Known model numbers are
-matched directly (`S9` Playbar, `S14` Beam Gen 1, `S19` Arc). Newer or unlisted
-soundbars — including the **Arc Ultra**, Beam Gen 2, and Ray — are matched by
-manufacturer + model name, so they work without adding a model number.
+matched directly (`S9` Playbar, `S14` Beam Gen 1, `S19` Arc, `S59` Beam Ultra).
+Newer or unlisted soundbars — including the **Arc Ultra**, Beam Gen 2, and Ray —
+are matched by manufacturer + model name, so they work without adding a model
+number.
 
 Non-soundbar Sonos speakers (One, Era, Move, etc.) do not expose these EQ
 settings and are intentionally not created.
@@ -19,6 +20,12 @@ settings and are intentionally not created.
 Note: on newer models such as the Arc Ultra, `DialogLevel` reports an intensity
 of 1–4 rather than a simple on/off. The Dialog Level switch treats any non-zero
 value as **on**; turning it off sends level 0.
+
+The **Beam Ultra** (announced Sept 1 2026, ships Sept 29 2026) is matched both by
+its `S59` model number and by the `beam` name fallback. Its actual UPnP behaviour
+has not been verified on hardware yet — if its "AI Speech Enhancement" reports as
+a `DialogLevel` intensity like the Arc Ultra, the non-zero-is-on handling already
+covers it. Use the curl command below to check what your unit reports.
 
 ## How to install (build it yourself)
 1. Install the SmartThings CLI: `npm install -g @smartthings/cli`
